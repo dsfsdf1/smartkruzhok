@@ -7,15 +7,20 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramAPIError
 
 from .store import Store
-from .ui import routes
+from .ui import COMMANDS, routes
 from .worker import Worker
 
 
 async def main(token, root):
     session = AiohttpSession(timeout=45)
     async with Bot(token, session=session) as bot:
+        try:
+            await bot.set_my_commands(COMMANDS, request_timeout=5)
+        except TelegramAPIError as error:
+            logging.getLogger(__name__).warning("menu_setup_failed code=%s", type(error).__name__)
         dispatcher = Dispatcher()
         store = Store(root / "bot.sqlite3")
         dispatcher.include_router(routes(store))

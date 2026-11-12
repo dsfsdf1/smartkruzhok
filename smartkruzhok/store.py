@@ -53,6 +53,7 @@ class Store:
             return None
         clip_id = uuid4().hex[:16]
         with self.db:
+            self.clear_prompts(chat)
             self.db.execute(
                 "INSERT INTO clips VALUES (?, ?, ?, ?, ?)",
                 (clip_id, chat, message, json.dumps({"revision": 0}), time.time() + TTL),
@@ -107,9 +108,26 @@ class Store:
         return self.clip(row["id"], chat) if row else None
 
     def busy(self, chat):
-        return self.db.execute(
-            "SELECT 1 FROM jobs WHERE chat = ? AND status IN ('queued', 'running')", (chat,),
-        ).fetchone() is not None
+        return self.active_job(chat) is not None
+
+    def active_job(self, chat):
+        return self.db.execute("""
+            SELECT * FROM jobs WHERE chat = ? AND status IN ('queued', 'running')
+        """, (chat,)).fetchone()
+
+    def clear_prompts(self, chat):
+        self.db.execute("""
+            UPDATE clips SET state = json_remove(state, '$.prompt')
+            WHERE chat = ? AND json_type(state, '$.prompt') IS NOT NULL
+        """, (chat,))
+
+    def reset_chat(self, chat):
+        with self.db:
+            self.clear_prompts(chat)
+            job = self.active_job(chat)
+            if job is not None:
+                self._cancel(job)
+        return job
 
     def take(self):
         with self.db:
@@ -144,18 +162,18 @@ class Store:
             )
 
     def request_cancel(self, chat, message):
-        row = self.db.execute("""
-            SELECT * FROM jobs WHERE chat = ? AND status IN ('queued', 'running')
-                AND json_extract(args, '$.progress') = ?
-        """, (chat, message)).fetchone()
-        if row is None:
+        job = self.active_job(chat)
+        if job is None or json.loads(job["args"]).get("progress") != message:
             return None
         with self.db:
-            if row["status"] == "queued" and not row["sending"]:
-                self.db.execute("UPDATE jobs SET status = 'cancelled', args = '{}' WHERE id = ?", (row["id"],))
-            else:
-                self.db.execute("UPDATE jobs SET cancel_requested = 1 WHERE id = ?", (row["id"],))
-        return row
+            self._cancel(job)
+        return job
+
+    def _cancel(self, job):
+        if job["status"] == "queued" and not job["sending"]:
+            self.db.execute("UPDATE jobs SET status = 'cancelled', args = '{}' WHERE id = ?", (job["id"],))
+        else:
+            self.db.execute("UPDATE jobs SET cancel_requested = 1 WHERE id = ?", (job["id"],))
 
     def cancelling(self, job_id):
         return bool(self.db.execute("SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)).fetchone()[0])

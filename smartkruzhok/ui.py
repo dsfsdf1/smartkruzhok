@@ -1,15 +1,33 @@
+import json
 import re
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import CommandStart
-from aiogram.types import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+    Message, ReplyKeyboardMarkup,
+)
 
 from .media import FPS, MAX_BYTES, PART_FRAMES, wrap
 
-START = "SmartKruzhok 2.0. Пришли видео или файл MP4, MOV или WebM до 20 МБ и 3 минут. Я сделаю кружок."
+NEW_VIDEO = "🎬 Новое видео"
+STATUS = "📋 Статус"
+RESET = "🔄 Начать заново"
+UPLOAD = "Пришли видео или прикрепи файл MP4, MOV или WebM. До 20 МБ и 3 минут."
 EXPIRED = "Срок редактирования истёк. Отправь видео снова."
-BUSY = "Я ещё обрабатываю предыдущее задание."
+BUSY = "Предыдущее задание ещё в работе. Дождись результата или нажми «Начать заново»."
+MENU = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text=NEW_VIDEO)], [KeyboardButton(text=STATUS), KeyboardButton(text=RESET)]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
+COMMANDS = [
+    BotCommand(command="new", description="Отправить новое видео"),
+    BotCommand(command="status", description="Проверить статус"),
+    BotCommand(command="reset", description="Начать заново"),
+    BotCommand(command="menu", description="Открыть главное меню"),
+]
 MODES = {"smart": "Умный фокус", "center": "По центру", "fit": "Вместить всё"}
 EFFECTS = {"off": "Без эффекта", "retro": "Ретро", "zoom": "Драматический зум"}
 SUBTITLES = {"off": "Выключены", "plain": "Обычные", "words": "Подсветка слов"}
@@ -27,8 +45,10 @@ def keys(clip, *rows):
 
 
 def result_keys(clip):
-    return keys(clip, [("Переделать кадр", "crop"), ("Оформить кружок", "decor")],
-                [("Выбрать фрагмент", "trim"), ("С субтитрами", "quick-subs")])
+    markup = keys(clip, [("Переделать кадр", "crop"), ("Оформить кружок", "decor")],
+                  [("Выбрать фрагмент", "trim"), ("С субтитрами", "quick-subs")])
+    markup.inline_keyboard.append([InlineKeyboardButton(text=NEW_VIDEO, callback_data="new-video")])
+    return markup
 
 
 def length_keys(clip):
@@ -110,8 +130,47 @@ def routes(store):
     router.message.filter(F.chat.type == "private")
 
     @router.message(CommandStart())
+    @router.message(Command("menu", "help"))
     async def start(message: Message):
-        await message.answer(START)
+        await message.answer("SmartKruzhok делает кружки из видео.\n\n" + UPLOAD, reply_markup=MENU)
+
+    @router.message(Command("new"))
+    @router.message(F.text == NEW_VIDEO)
+    async def new_video(message: Message):
+        await message.answer(BUSY if store.busy(message.chat.id) else UPLOAD, reply_markup=MENU)
+
+    @router.message(Command("status"))
+    @router.message(F.text == STATUS)
+    async def status(message: Message):
+        job = store.active_job(message.chat.id)
+        if job is None:
+            body = "Готов принять видео. Можно отправить его прямо в чат."
+        elif job["cancel_requested"]:
+            body = "Останавливаю задание. После остановки можно прислать новое видео."
+        elif job["status"] == "queued":
+            body = "Видео в очереди. Начну обработку, когда освобожусь."
+        else:
+            body = "Обрабатываю видео. Пришлю результат в этот чат."
+        await message.answer(body, reply_markup=MENU)
+
+    @router.message(Command("reset"))
+    @router.message(F.text == RESET)
+    async def reset(message: Message):
+        job = store.reset_chat(message.chat.id)
+        if job is None:
+            body = "Начинаем заново. " + UPLOAD
+        elif job["status"] == "queued" and not job["sending"]:
+            body = "Задание отменено. " + UPLOAD
+            progress = json.loads(job["args"]).get("progress")
+            if progress:
+                try:
+                    await message.bot.edit_message_text("Задание отменено.", chat_id=message.chat.id,
+                                                        message_id=progress, request_timeout=5)
+                except TelegramAPIError:
+                    pass
+        else:
+            body = "Останавливаю задание после текущего этапа. Когда оно остановится, пришли новое видео."
+        await message.answer(body, reply_markup=MENU)
 
     @router.message(F.video | F.document)
     async def upload(message: Message):
@@ -122,7 +181,7 @@ def routes(store):
         if store.uploaded(message.chat.id, message.message_id):
             return
         if store.busy(message.chat.id):
-            await message.answer(BUSY)
+            await message.answer(BUSY, reply_markup=MENU)
             return
         progress = await queue_notice(message.answer)
         store.upload(message.chat.id, message.message_id, attachment.file_id, progress)
@@ -132,7 +191,8 @@ def routes(store):
         reply = message.reply_to_message
         clip = store.prompt(message.chat.id, reply.message_id) if reply else None
         if clip is None:
-            await message.answer(EXPIRED if reply and reply.from_user and reply.from_user.is_bot else START)
+            body = EXPIRED if reply and reply.from_user and reply.from_user.is_bot else UPLOAD
+            await message.answer(body, reply_markup=MENU)
             return
         if store.busy(message.chat.id):
             await message.answer(BUSY)
@@ -179,6 +239,12 @@ def routes(store):
             advance(store, clip)
             body, markup = subtitle_panel(clip, index // 6)
             await message.answer(body, reply_markup=markup)
+
+    @router.callback_query(F.data == "new-video")
+    async def next_video(query):
+        await query.answer()
+        if isinstance(query.message, Message) and query.message.chat.type == "private":
+            await new_video(query.message)
 
     @router.callback_query(F.data == "cancel-job")
     async def cancel_job(query):
@@ -340,6 +406,6 @@ def routes(store):
 
     @router.message()
     async def other(message: Message):
-        await message.answer(START)
+        await message.answer(UPLOAD, reply_markup=MENU)
 
     return router
