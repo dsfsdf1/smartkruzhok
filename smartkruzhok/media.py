@@ -418,40 +418,54 @@ def text_overlay(text, y, size, highlighted=-1, *, compact=False):
     face = font(size)
     step = size + 6
     width = math.ceil(max(face.getlength(line) for line in lines)) + 20
-    height = len(lines) * step + 10
-    x, top = (SIZE - width) // 2, y - height // 2
-    layer = Image.new("RGBA", (width, height))
-    draw = ImageDraw.Draw(layer)
-    draw.rounded_rectangle((0, 0, width - 1, height - 1), radius=11, fill=(12, 12, 16, 215))
+    ascent, descent = face.getmetrics()
+    text_layer = Image.new("RGBA", (width, ascent + descent + (len(lines) - 1) * step + 4))
+    draw = ImageDraw.Draw(text_layer)
     word_index = 0
     for index, line in enumerate(lines):
         left = (width - face.getlength(line)) / 2
-        baseline = 5 + index * step
+        baseline = 2 + ascent + index * step
         if highlighted < 0:
-            draw.text((left, baseline), line, font=face, fill="white", anchor="lt")
+            draw.text((left, baseline), line, font=face, fill="white", anchor="ls")
             continue
         prefix = ""
         for word in line.split():
             color = "#ffdb58" if word_index == highlighted else "white"
-            draw.text((left + face.getlength(prefix), baseline), word, font=face, fill=color, anchor="lt")
+            draw.text((left + face.getlength(prefix), baseline), word, font=face, fill=color, anchor="ls")
             prefix += word + " "
             word_index += 1
+    bounds = text_layer.getbbox()
+    if bounds is None:
+        return None
+    ink = text_layer.crop(bounds)
+    width, height = ink.width + 20, ink.height + 16
+    x, top = (SIZE - width) // 2, y - height // 2
+    layer = Image.new("RGBA", (width, height))
+    ImageDraw.Draw(layer).rounded_rectangle((0, 0, width - 1, height - 1), radius=11, fill=(12, 12, 16, 215))
+    layer.alpha_composite(ink, (10, 8))
     rgba = np.asarray(layer)
     return (x, top, width, height), rgba[:, :, :3][:, :, ::-1], rgba[:, :, 3:4].astype(np.float32) / 255
 
 
-def decorate(canvas, face, title, position, caption, highlighted):
+def decorate(canvas, face, title, position, caption, highlighted, *, subtitle_position="auto"):
     title_y = 105 if position == "top" else 375
+    fixed_subtitles = subtitle_position in ("top", "bottom")
+    if fixed_subtitles and subtitle_position == position:
+        # Keep both layers on the selected side and the title still between captions.
+        title_y += 100 if position == "top" else -100
     title_layer = text_overlay(title, title_y, 29) if title else None
     layers = [title_layer] if title_layer else []
     if caption:
-        positions = (375, 105) if not title_layer or position == "top" else (105, 375)
+        if fixed_subtitles:
+            positions = (105,) if subtitle_position == "top" else (375,)
+        else:
+            positions = (375, 105) if not title_layer or position == "top" else (105, 375)
         caption_layer = None
         for y in positions:
             candidate = text_overlay(caption, y, 29, highlighted, compact=True)
             if candidate is None:
                 break
-            if title_layer and overlaps(candidate[0], title_layer[0]):
+            if not fixed_subtitles and title_layer and overlaps(candidate[0], title_layer[0]):
                 continue
             caption_layer = candidate
             if face is None or not overlaps(candidate[0], face):
@@ -537,8 +551,13 @@ def frame_for(frame, number, settings, trajectory, lines, starts, mask):
     if border := settings.get("border"):
         visual_effects.add_border(canvas, border)
     visual_effects.add_stickers(canvas, settings.get("stickers", {}), elapsed)
-    caption, highlighted = caption_at(lines, starts, settings.get("subtitles"), number / FPS)
-    canvas = decorate(canvas, face, settings.get("title", ""), settings.get("position"), caption, highlighted)
+    subtitle_mode = settings.get("subtitles")
+    caption, highlighted = caption_at(lines, starts, subtitle_mode, number / FPS)
+    subtitle_position = "auto"
+    if lines and subtitle_mode in ("plain", "words"):
+        subtitle_position = settings.get("subtitle_position", "auto")
+    canvas = decorate(canvas, face, settings.get("title", ""), settings.get("position", "bottom"),
+                      caption, highlighted, subtitle_position=subtitle_position)
     if mask:
         canvas[~CIRCLE] = (26, 25, 24)
     return canvas

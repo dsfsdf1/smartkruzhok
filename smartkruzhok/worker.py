@@ -225,8 +225,8 @@ class Worker:
 
         if job["kind"] == "crop_preview":
             settings["mode"] = job["args"]["mode"]
-        needs_face = (settings["mode"] == "smart" or "zoom" in media.active_effects(settings)
-                      or settings.get("subtitles") in ("plain", "words"))
+        auto_subtitles = wants_subtitles and settings.get("subtitle_position", "auto") == "auto"
+        needs_face = settings["mode"] == "smart" or "zoom" in media.active_effects(settings) or auto_subtitles
         trajectory = []
         if needs_face:
             await self.step(job, "Подбираю кадр.")

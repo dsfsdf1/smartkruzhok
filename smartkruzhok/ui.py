@@ -35,6 +35,7 @@ BORDER_NAMES = {"white": "Белый", "neon": "Неон", "pink": "Розовы
 EFFECT_SECTIONS = {"border": "Рамка", "stickers": "Стикеры", "monochrome": "Чёрно-белое"}
 STICKER_PANELS = {f"sticker-{name}" for name in STICKERS}
 SUBTITLES = {"off": "Выключены", "plain": "Обычные", "words": "Подсветка слов"}
+SUBTITLE_POSITIONS = {"auto": "Авто", "top": "Сверху", "bottom": "Снизу"}
 CANCEL_KEYS = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="Отменить", callback_data="cancel-job"),
 ]])
@@ -118,11 +119,15 @@ def advance(store, clip):
 
 def decor_panel(clip):
     settings = clip["state"]["settings"]
+    subtitle_mode = settings.get("subtitles", "off")
+    subtitles = SUBTITLES[subtitle_mode]
+    if subtitle_mode != "off":
+        subtitles += f' · {SUBTITLE_POSITIONS[settings.get("subtitle_position", "auto")]}'
     labels = [EFFECTS[effect] for effect in active_effects(settings)]
     labels.extend(label for key, label in EFFECT_SECTIONS.items() if key in settings)
     effects = ", ".join(labels)
     return (
-        f'Субтитры · {SUBTITLES[settings.get("subtitles", "off")]}\n'
+        f'Субтитры · {subtitles}\n'
         f'Надпись · {settings.get("title") or "выключена"}\n'
         f'Эффекты · {effects or EFFECTS["off"]}',
         keys(clip, [("Субтитры", "subs"), ("Надпись", "title"), ("Эффекты", "effects")],
@@ -132,14 +137,18 @@ def decor_panel(clip):
 
 
 def subtitle_panel(clip, page=0):
-    lines = clip["state"].get("lines", [])
+    state = clip["state"]
+    lines = state.get("lines", [])
     page = max(0, min(page, max(0, (len(lines) - 1) // 6)))
     first = page * 6
     rows = [
         [("Обычные", "sub-plain"), ("Подсветка слов", "sub-words"), ("Выключить", "sub-off")],
     ]
-    content = ["Выбери стиль или строку для правки."]
+    content = ["Выбери стиль, расположение или строку для правки."]
     if lines:
+        position = state["settings"].get("subtitle_position", "auto")
+        rows.append([(f"✓ {label}" if value == position else label, f"sub-pos-{value}-{page}")
+                     for value, label in SUBTITLE_POSITIONS.items()])
         numbers = []
         for index, line in enumerate(lines[first:first + 6], first):
             content.append(f'{index + 1}. {line["text"] or "Удалена"}')
@@ -152,7 +161,7 @@ def subtitle_panel(clip, page=0):
             navigation.append(("Дальше ›", f"page-{page + 1}"))
         if navigation:
             rows.append(navigation)
-    elif "lines" in clip["state"]:
+    elif "lines" in state:
         content = ["В видео не удалось найти речь."]
         rows = []
     rows.append([("‹ К оформлению", "decor")])
@@ -409,6 +418,7 @@ def routes(store):
         state = clip["state"]
         settings = state.get("settings")
         page = action[5:] if action.startswith("page-") else ""
+        subtitle_position = re.fullmatch(r"sub-pos-(auto|top|bottom)-(\d+)", action)
         preview_at = re.fullmatch(r"(decor|effects)-at-([0-9]{1,3})", action)
         navigation = action in EDITOR_PANELS or page.isdigit()
         if not navigation and state["revision"] != int(revision):
@@ -494,6 +504,12 @@ def routes(store):
             settings["subtitles"] = action[4:]
             advance(store, clip)
             await show_decor()
+        elif subtitle_position:
+            position, subtitle_page = subtitle_position.groups()
+            settings["subtitle_position"] = position
+            advance(store, clip)
+            body, markup = subtitle_panel(clip, int(subtitle_page))
+            await answer(body, reply_markup=markup)
         elif page.isdigit():
             body, markup = subtitle_panel(clip, int(page))
             await answer(body, reply_markup=markup)
