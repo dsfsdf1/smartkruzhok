@@ -10,7 +10,8 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNet
 from aiogram.types import FSInputFile
 
 from . import media
-from .ui import CANCEL_KEYS, MODES, editor_back, keys, length_keys, result_keys, subtitle_panel
+from .effects import timed_events
+from .ui import CANCEL_KEYS, MODES, editor_back, keys, length_keys, result_keys, subtitle_panel, time_label
 
 log = logging.getLogger(__name__)
 
@@ -278,15 +279,20 @@ class Worker:
         )
 
     async def decor_preview(self, job, clip, source, video, settings, trajectory, lines, parts, scratch):
-        start, end = parts[0]
-        first = start
-        span = 4 * media.FPS
-        if settings.get("subtitles") in ("plain", "words") and not job["args"].get("zoom"):
+        origin = parts[0][0]
+        duration = parts[-1][1] - origin
+        events = [second for second in timed_events(settings) if second * media.FPS < duration]
+        second = job["args"].get("at", 0 if job["args"].get("zoom") else None)
+        focus = origin + second * media.FPS if second is not None else None
+        if focus is None and settings.get("subtitles") in ("plain", "words"):
             line = next((line for line in lines if line["text"]), None)
             if line:
-                line_start = int(line["start"] * media.FPS)
-                start, end = next((part for part in parts if part[0] <= line_start < part[1]), parts[0])
-                first = min(max(start, line_start - media.FPS // 2), max(start, end - span))
+                focus = int(line["start"] * media.FPS)
+        if focus is None or not origin <= focus < origin + duration:
+            focus = origin + events[0] * media.FPS if events else origin
+        span = 4 * media.FPS
+        start, end = next((part for part in parts if part[0] <= focus < part[1]), parts[0])
+        first = min(max(start, focus - media.FPS // 2), max(start, end - span))
         last = min(end, first + span)
         path = scratch / "preview.mp4"
         await self.step(job, "Готовлю предпросмотр.")
@@ -296,9 +302,11 @@ class Worker:
         await self.edit_notice(job, "Предпросмотр готов.")
         back = editor_back(job["kind"], job["args"])
         rows = [[("Сделать кружок", "decor-render"), ("‹ Назад", back)]]
-        if "zoom" in media.active_effects(settings) and first > parts[0][0]:
-            action = "effects-zoom-preview" if back == "effects" else "zoom-preview"
-            rows.append([("Посмотреть начало", action)])
+        moments = [(f"▶ {time_label(second)}", f"{back}-at-{second}")
+                   for second in events if second and not first <= origin + second * media.FPS < last]
+        if first > origin:
+            moments = [("С начала", f"{back}-at-0"), *moments]
+        rows.extend(moments[index:index + 3] for index in range(0, len(moments), 3))
         await self.bot.send_video(
             clip["chat"], FSInputFile(path), caption="Предпросмотр оформления",
             width=media.SIZE, height=media.SIZE, supports_streaming=True, reply_markup=keys(clip, *rows),

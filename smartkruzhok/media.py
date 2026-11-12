@@ -15,6 +15,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
+from . import effects as visual_effects
+
 SIZE = 480
 FPS = 24
 DETECT_FPS = 6
@@ -524,8 +526,17 @@ def caption_at(lines, starts, mode, seconds):
 
 
 def frame_for(frame, number, settings, trajectory, lines, starts, mask):
-    canvas, face = compose_frame(frame, settings["mode"], active_effects(settings), number, trajectory,
-                                 settings.get("zoom_start", 0))
+    effects = active_effects(settings)
+    start = settings.get("zoom_start", 0)
+    elapsed = (number - start) / FPS
+    canvas, face = compose_frame(frame, settings["mode"], effects, number, trajectory, start)
+    if "film" in effects:
+        canvas = visual_effects.film_frame(canvas, number)
+    if "monochrome" in settings and elapsed >= settings["monochrome"]:
+        canvas = cv2.cvtColor(cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    if border := settings.get("border"):
+        visual_effects.add_border(canvas, border)
+    visual_effects.add_stickers(canvas, settings.get("stickers", {}), elapsed)
     caption, highlighted = caption_at(lines, starts, settings.get("subtitles"), number / FPS)
     canvas = decorate(canvas, face, settings.get("title", ""), settings.get("position"), caption, highlighted)
     if mask:

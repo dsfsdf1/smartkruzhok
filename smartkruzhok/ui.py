@@ -9,7 +9,8 @@ from aiogram.types import (
     Message, ReplyKeyboardMarkup,
 )
 
-from .media import FPS, MAX_BYTES, PART_FRAMES, active_effects, wrap
+from .effects import BORDER_COLORS, STICKERS
+from .media import FPS, MAX_BYTES, PART_FRAMES, Video, active_effects, wrap
 
 NEW_VIDEO = "🎬 Новое видео"
 STATUS = "📋 Статус"
@@ -29,12 +30,16 @@ COMMANDS = [
     BotCommand(command="menu", description="Открыть главное меню"),
 ]
 MODES = {"smart": "Умный фокус", "center": "По центру", "fit": "Вместить всё"}
-EFFECTS = {"off": "Без эффекта", "retro": "Ретро", "zoom": "Драматический зум"}
+EFFECTS = {"off": "Без эффекта", "retro": "Ретро", "zoom": "Драматический зум", "film": "Плёнка"}
+BORDER_NAMES = {"white": "Белый", "neon": "Неон", "pink": "Розовый", "gold": "Золотой"}
+EFFECT_SECTIONS = {"border": "Рамка", "stickers": "Стикеры", "monochrome": "Чёрно-белое"}
+STICKER_PANELS = {f"sticker-{name}" for name in STICKERS}
 SUBTITLES = {"off": "Выключены", "plain": "Обычные", "words": "Подсветка слов"}
 CANCEL_KEYS = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="Отменить", callback_data="cancel-job"),
 ]])
-EDITOR_PANELS = {"result", "length", "decor", "crop", "subs", "title", "title-position", "effects"}
+EDITOR_PANELS = {"result", "length", "decor", "crop", "subs", "title", "title-position", "effects",
+                 *EFFECT_SECTIONS, *STICKER_PANELS}
 
 
 def keys(clip, *rows):
@@ -78,6 +83,24 @@ def fragment_frames(text, video):
     return None
 
 
+def time_label(second):
+    minutes, seconds = divmod(second, 60)
+    return f"{minutes}:{seconds:02}"
+
+
+def selected_frames(state):
+    parts = Video(**state["video"]).parts(state["series"], state.get("fragment"))
+    return parts[-1][1] - parts[0][0]
+
+
+def effect_second(value, state):
+    if not re.fullmatch(r"[0-9]{1,3}(?::[0-5][0-9])?", value):
+        return None
+    minutes, _, seconds = value.rpartition(":")
+    second = 60 * int(minutes or 0) + int(seconds)
+    return second if second * FPS < selected_frames(state) else None
+
+
 async def queue_notice(answer):
     try:
         message = await answer("В очереди. Начну обработку, как только освобожусь.",
@@ -95,7 +118,9 @@ def advance(store, clip):
 
 def decor_panel(clip):
     settings = clip["state"]["settings"]
-    effects = ", ".join(EFFECTS[effect] for effect in active_effects(settings))
+    labels = [EFFECTS[effect] for effect in active_effects(settings)]
+    labels.extend(label for key, label in EFFECT_SECTIONS.items() if key in settings)
+    effects = ", ".join(labels)
     return (
         f'Субтитры · {SUBTITLES[settings.get("subtitles", "off")]}\n'
         f'Надпись · {settings.get("title") or "выключена"}\n'
@@ -139,15 +164,56 @@ def title_position_keys(clip):
 
 
 async def show_effects(answer, clip):
-    enabled = active_effects(clip["state"]["settings"])
+    settings = clip["state"]["settings"]
+    enabled = active_effects(settings)
     buttons = [(f"✓ {label}" if value in enabled else label, f"effect-{value}")
                for value, label in EFFECTS.items() if value != "off"]
+    sections = [(f"✓ {label}" if key in settings else label, key) for key, label in EFFECT_SECTIONS.items()]
     actions = [("Предпросмотр", "effects-preview")]
-    if enabled:
+    if enabled or EFFECT_SECTIONS.keys() & settings.keys():
         actions.append(("Отключить все", "effect-off"))
-    await answer("Нажми на эффект, чтобы включить или выключить его.", reply_markup=keys(
-        clip, buttons, actions, [("‹ К оформлению", "decor")],
+    await answer("Выбери эффекты для кружка.", reply_markup=keys(
+        clip, buttons, sections, actions, [("‹ К оформлению", "decor")],
     ))
+
+
+async def show_effect_settings(answer, clip, section):
+    state = clip["state"]
+    settings = state["settings"]
+    second = None
+    back = "effects"
+    if section == "border":
+        color = settings.get("border")
+        body = f"Цвет рамки · {color}" if color else "Выбери цвет рамки."
+        presets = [(f"✓ {label}" if BORDER_COLORS[key] == color else label, f"border-{key}")
+                   for key, label in BORDER_NAMES.items()]
+        rows = [presets[:2], presets[2:], [("Свой цвет", "border-custom")]]
+        if color:
+            rows[-1].append(("Убрать рамку", "border-off"))
+    elif section == "monochrome":
+        second = settings.get("monochrome")
+        body = "Когда видео должно стать чёрно-белым?"
+        if second is not None:
+            body += f"\nСейчас · с {time_label(second)}"
+        rows = [[("С начала", "mono-start"), ("Выбрать секунду", "time-mono")]]
+        if second is not None:
+            rows.append([("Выключить", "mono-off")])
+    elif section == "stickers":
+        stickers = settings.get("stickers", {})
+        body = "Выбери стикер и укажи, когда его показать."
+        rows = [[(f"{label} · {time_label(stickers[name])}" if name in stickers else label, f"sticker-{name}")]
+                for name, label in STICKERS.items()]
+    else:
+        name = section.removeprefix("sticker-")
+        second = settings.get("stickers", {}).get(name)
+        body = STICKERS[name] if second is None else f"{STICKERS[name]} · {time_label(second)}"
+        rows = [[("Изменить секунду" if second is not None else "Выбрать секунду", f"time-{name}")]]
+        if second is not None:
+            rows[0].append(("Убрать стикер", f"remove-{name}"))
+        back = "stickers"
+    if second is not None and second * FPS >= selected_frames(state):
+        body += "\nЭто время за пределами выбранного фрагмента."
+    await answer(body, reply_markup=keys(clip, *rows, [("‹ Назад", back)]))
 
 
 async def ask_for_input(answer, store, clip, text, prompt):
@@ -241,6 +307,29 @@ def routes(store):
         state = clip["state"]
         prompt = state["prompt"]
         value = " ".join(message.text.split())
+        if prompt["kind"] == "border-color":
+            if not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
+                await ask_for_input(message.answer, store, clip,
+                                    "Введи цвет из шести символов, например #38E8C6.", prompt)
+                return
+            state["settings"]["border"] = "#" + value.lstrip("#").upper()
+            advance(store, clip)
+            await show_effect_settings(message.answer, clip, "border")
+            return
+        if prompt["kind"] == "effect-time":
+            second = effect_second(value, state)
+            if second is None:
+                await ask_for_input(message.answer, store, clip,
+                                    "Укажи время внутри выбранного видео, например 0:03 или 3.", prompt)
+                return
+            name = prompt["effect"]
+            if name == "mono":
+                state["settings"]["monochrome"] = second
+            else:
+                state["settings"].setdefault("stickers", {})[name] = second
+            advance(store, clip)
+            await show_effect_settings(message.answer, clip, prompt["back"])
+            return
         if prompt["kind"] == "trim":
             fragment = fragment_frames(value, state["video"])
             if fragment is None:
@@ -320,6 +409,7 @@ def routes(store):
         state = clip["state"]
         settings = state.get("settings")
         page = action[5:] if action.startswith("page-") else ""
+        preview_at = re.fullmatch(r"(decor|effects)-at-([0-9]{1,3})", action)
         navigation = action in EDITOR_PANELS or page.isdigit()
         if not navigation and state["revision"] != int(revision):
             await query.answer("Настройки уже изменились.")
@@ -439,20 +529,59 @@ def routes(store):
             await show_decor()
         elif action == "effects":
             await show_effects(answer, clip)
+        elif action in EFFECT_SECTIONS or action in STICKER_PANELS:
+            await show_effect_settings(answer, clip, action)
+        elif action == "border-custom":
+            await ask_for_input(answer, store, clip, "Введи код цвета, например #38E8C6.",
+                                {"kind": "border-color", "back": "border"})
+        elif action == "border-off" or (action.startswith("border-") and action[7:] in BORDER_COLORS):
+            if action == "border-off":
+                settings.pop("border", None)
+            else:
+                settings["border"] = BORDER_COLORS[action[7:]]
+            advance(store, clip)
+            await show_effect_settings(answer, clip, "border")
+        elif action in ("mono-start", "mono-off"):
+            if action == "mono-off":
+                settings.pop("monochrome", None)
+            else:
+                settings["monochrome"] = 0
+            advance(store, clip)
+            await show_effect_settings(answer, clip, "monochrome")
+        elif action.startswith("time-") and (action[5:] == "mono" or action[5:] in STICKERS):
+            name = action[5:]
+            back = "monochrome" if name == "mono" else f"sticker-{name}"
+            await ask_for_input(answer, store, clip,
+                                "Укажи время от начала выбранного видео, например 0:03 или 3.",
+                                {"kind": "effect-time", "effect": name, "back": back})
+        elif action.startswith("remove-") and action[7:] in STICKERS:
+            name = action[7:]
+            stickers = settings.get("stickers", {})
+            stickers.pop(name, None)
+            if not stickers:
+                settings.pop("stickers", None)
+            advance(store, clip)
+            await show_effect_settings(answer, clip, f"sticker-{name}")
         elif action.startswith("effect-") and action[7:] in EFFECTS:
             effect = action[7:]
             enabled = set(active_effects(settings))
             if effect == "off":
                 enabled.clear()
+                for key in EFFECT_SECTIONS:
+                    settings.pop(key, None)
             else:
                 enabled.symmetric_difference_update((effect,))
             settings["effects"] = [value for value in EFFECTS if value in enabled]
             settings.pop("effect", None)
             advance(store, clip)
             await show_effects(answer, clip)
+        elif preview_at:
+            back, second = preview_at.groups()
+            await enqueue("decor_preview", revise=True, at=int(second), back=back)
         elif action in ("decor-preview", "zoom-preview", "effects-preview", "effects-zoom-preview"):
             back = "effects" if action.startswith("effects-") else "decor"
-            await enqueue("decor_preview", revise=True, zoom=action.endswith("zoom-preview"), back=back)
+            at = 0 if action.endswith("zoom-preview") else None
+            await enqueue("decor_preview", revise=True, at=at, back=back)
         elif action == "decor-render":
             await enqueue("render", revise=True, back="decor")
 
