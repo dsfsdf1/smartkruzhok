@@ -18,11 +18,16 @@ from .media import FPS, MAX_BYTES, PART_FRAMES, Video, active_effects, wrap
 NEW_VIDEO = "🎬 Новое видео"
 STATUS = "📋 Статус"
 RESET = "🔄 Начать заново"
+FEEDBACK = "💬 Обратная связь"
 UPLOAD = "Пришли видео или прикрепи файл MP4, MOV или WebM. До 20 МБ и 3 минут."
 EXPIRED = "Срок редактирования истёк. Отправь видео снова."
 BUSY = "Предыдущее задание ещё в работе. Дождись результата или нажми «Начать заново»."
 MENU = ReplyKeyboardMarkup(
-    keyboard=[[KeyboardButton(text=NEW_VIDEO)], [KeyboardButton(text=STATUS), KeyboardButton(text=RESET)]],
+    keyboard=[
+        [KeyboardButton(text=NEW_VIDEO)],
+        [KeyboardButton(text=STATUS), KeyboardButton(text=RESET)],
+        [KeyboardButton(text=FEEDBACK)],
+    ],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -30,6 +35,7 @@ COMMANDS = [
     BotCommand(command="new", description="Отправить новое видео"),
     BotCommand(command="status", description="Проверить статус"),
     BotCommand(command="reset", description="Начать заново"),
+    BotCommand(command="feedback", description="Оставить отзыв или предложить идею"),
     BotCommand(command="menu", description="Открыть главное меню"),
 ]
 MODES = {"smart": "Умный фокус", "center": "По центру", "fit": "Вместить всё"}

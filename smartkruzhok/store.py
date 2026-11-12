@@ -37,6 +37,16 @@ class Store:
             );
             CREATE UNIQUE INDEX IF NOT EXISTS one_job_per_chat ON jobs(chat)
                 WHERE status IN ('queued', 'running');
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY,
+                body TEXT NOT NULL,
+                created INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS feedback_prompts (
+                chat INTEGER PRIMARY KEY,
+                message INTEGER NOT NULL,
+                expires REAL NOT NULL
+            );
         """)
         with self.db:
             if not any(column["name"] == "cancel_requested" for column in self.db.execute("PRAGMA table_info(jobs)")):
@@ -110,6 +120,37 @@ class Store:
             ORDER BY json_extract(state, '$.prompt.message') DESC LIMIT 1
         """, (chat, time.time(), message, message)).fetchone()
         return self.clip(row["id"], chat) if row else None
+
+    def open_feedback(self, chat, message):
+        now = time.time()
+        with self.db:
+            self.db.execute("DELETE FROM feedback_prompts WHERE expires < ?", (now,))
+            self.db.execute("""
+                INSERT INTO feedback_prompts (chat, message, expires) VALUES (?, ?, ?)
+                ON CONFLICT(chat) DO UPDATE SET message = excluded.message, expires = excluded.expires
+            """, (chat, message, now + TTL))
+
+    def feedback_prompt(self, chat, message):
+        return self.db.execute("""
+            SELECT 1 FROM feedback_prompts WHERE chat = ? AND message = ? AND expires >= ?
+        """, (chat, message, time.time())).fetchone() is not None
+
+    def save_feedback(self, chat, message, body):
+        now = time.time()
+        with self.db:
+            removed = self.db.execute("""
+                DELETE FROM feedback_prompts WHERE chat = ? AND message = ? AND expires >= ?
+            """, (chat, message, now)).rowcount
+            if not removed:
+                return False
+            self.db.execute("INSERT INTO feedback (body, created) VALUES (?, ?)", (body, int(now)))
+        return True
+
+    def recent_feedback(self, limit, before=None):
+        return self.db.execute("""
+            SELECT id, body, created FROM feedback
+            WHERE (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?
+        """, (before, before, limit)).fetchall()
 
     def busy(self, chat):
         return self.active_job(chat) is not None
