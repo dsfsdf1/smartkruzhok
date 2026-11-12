@@ -9,7 +9,10 @@ from aiogram.types import (
     Message, ReplyKeyboardMarkup,
 )
 
-from .effects import BORDER_COLORS, STICKERS
+from .effects import (
+    BORDER_COLORS, MAX_STICKERS_PER_SIDE, STICKER_POSITIONS, STICKER_PRESETS,
+    parse_stickers, sticker_image, sticker_rows,
+)
 from .media import FPS, MAX_BYTES, PART_FRAMES, Video, active_effects, wrap
 
 NEW_VIDEO = "🎬 Новое видео"
@@ -33,7 +36,8 @@ MODES = {"smart": "Умный фокус", "center": "По центру", "fit":
 EFFECTS = {"off": "Без эффекта", "retro": "Ретро", "zoom": "Драматический зум", "film": "Плёнка"}
 BORDER_NAMES = {"white": "Белый", "neon": "Неон", "pink": "Розовый", "gold": "Золотой"}
 EFFECT_SECTIONS = {"border": "Рамка", "stickers": "Стикеры", "monochrome": "Чёрно-белое"}
-STICKER_PANELS = {f"sticker-{name}" for name in STICKERS}
+STICKER_PANELS = {f"sticker-{side}" for side in STICKER_POSITIONS}
+STICKER_INPUT_HINT = "Отправь до трёх обычных эмодзи с клавиатуры, например 🔥✨🎉."
 SUBTITLES = {"off": "Выключены", "plain": "Обычные", "words": "Подсветка слов"}
 SUBTITLE_POSITIONS = {"auto": "Авто", "top": "Сверху", "bottom": "Снизу"}
 CANCEL_KEYS = InlineKeyboardMarkup(inline_keyboard=[[
@@ -207,22 +211,40 @@ async def show_effect_settings(answer, clip, section):
         rows = [[("С начала", "mono-start"), ("Выбрать секунду", "time-mono")]]
         if second is not None:
             rows.append([("Выключить", "mono-off")])
-    elif section == "stickers":
-        stickers = settings.get("stickers", {})
-        body = "Выбери стикер и укажи, когда его показать."
-        rows = [[(f"{label} · {time_label(stickers[name])}" if name in stickers else label, f"sticker-{name}")]
-                for name, label in STICKERS.items()]
     else:
-        name = section.removeprefix("sticker-")
-        second = settings.get("stickers", {}).get(name)
-        body = STICKERS[name] if second is None else f"{STICKERS[name]} · {time_label(second)}"
-        rows = [[("Изменить секунду" if second is not None else "Выбрать секунду", f"time-{name}")]]
-        if second is not None:
-            rows[0].append(("Убрать стикер", f"remove-{name}"))
-        back = "stickers"
+        stickers = sticker_rows(settings)
+        if section == "stickers":
+            body = "Где показать стикеры?"
+            rows = [[(f"{label} {' '.join(stickers[side])}" if side in stickers else label, f"sticker-{side}")]
+                    for side, label in STICKER_POSITIONS.items()]
+        else:
+            side = section.removeprefix("sticker-")
+            current = stickers.get(side, [])
+            body = f'{STICKER_POSITIONS[side]} · {" ".join(current) or "Выбери до трёх эмодзи"}'
+            buttons = [(f"✓ {symbol}" if symbol in current else symbol, f"sticker-pick-{side}-{index}")
+                       for index, symbol in enumerate(STICKER_PRESETS) if sticker_image(symbol) is not None]
+            rows = [buttons[index:index + 6] for index in range(0, len(buttons), 6)]
+            rows.append([("Ввести эмодзи", f"sticker-input-{side}")])
+            if current:
+                rows[-1].append(("Убрать все", f"sticker-clear-{side}"))
+            back = "stickers"
     if second is not None and second * FPS >= selected_frames(state):
         body += "\nЭто время за пределами выбранного фрагмента."
     await answer(body, reply_markup=keys(clip, *rows, [("‹ Назад", back)]))
+
+
+def save_stickers(store, clip, side, symbols):
+    settings = clip["state"]["settings"]
+    stickers = sticker_rows(settings)
+    if symbols:
+        stickers[side] = symbols
+    else:
+        stickers.pop(side, None)
+    if stickers:
+        settings["stickers"] = stickers
+    else:
+        settings.pop("stickers", None)
+    advance(store, clip)
 
 
 async def ask_for_input(answer, store, clip, text, prompt):
@@ -288,6 +310,14 @@ def routes(store):
             body = "Останавливаю задание после текущего этапа. Когда оно остановится, пришли новое видео."
         await message.answer(body, reply_markup=MENU)
 
+    async def awaiting_stickers(message: Message):
+        clip = store.prompt(message.chat.id)
+        return clip is not None and clip["state"]["prompt"]["kind"] == "sticker-input"
+
+    @router.message(F.document | F.sticker | F.photo | F.animation, awaiting_stickers)
+    async def sticker_attachment(message: Message):
+        await message.answer(STICKER_INPUT_HINT)
+
     @router.message(F.video | F.document)
     async def upload(message: Message):
         attachment = message.video or message.document
@@ -316,6 +346,15 @@ def routes(store):
         state = clip["state"]
         prompt = state["prompt"]
         value = " ".join(message.text.split())
+        if prompt["kind"] == "sticker-input":
+            custom = any(entity.type == "custom_emoji" for entity in message.entities or ())
+            symbols = None if custom else parse_stickers(value)
+            if symbols is None:
+                await ask_for_input(message.answer, store, clip, STICKER_INPUT_HINT, prompt)
+                return
+            save_stickers(store, clip, prompt["side"], symbols)
+            await show_effect_settings(message.answer, clip, prompt["back"])
+            return
         if prompt["kind"] == "border-color":
             if not re.fullmatch(r"#?[0-9a-fA-F]{6}", value):
                 await ask_for_input(message.answer, store, clip,
@@ -326,16 +365,16 @@ def routes(store):
             await show_effect_settings(message.answer, clip, "border")
             return
         if prompt["kind"] == "effect-time":
+            if prompt["effect"] != "mono":
+                advance(store, clip)
+                await show_effect_settings(message.answer, clip, "stickers")
+                return
             second = effect_second(value, state)
             if second is None:
                 await ask_for_input(message.answer, store, clip,
                                     "Укажи время внутри выбранного видео, например 0:03 или 3.", prompt)
                 return
-            name = prompt["effect"]
-            if name == "mono":
-                state["settings"]["monochrome"] = second
-            else:
-                state["settings"].setdefault("stickers", {})[name] = second
+            state["settings"]["monochrome"] = second
             advance(store, clip)
             await show_effect_settings(message.answer, clip, prompt["back"])
             return
@@ -419,6 +458,7 @@ def routes(store):
         settings = state.get("settings")
         page = action[5:] if action.startswith("page-") else ""
         subtitle_position = re.fullmatch(r"sub-pos-(auto|top|bottom)-(\d+)", action)
+        sticker_action = re.fullmatch(r"sticker-(input|clear|pick)-(top|bottom)(?:-(\d{1,2}))?", action)
         preview_at = re.fullmatch(r"(decor|effects)-at-([0-9]{1,3})", action)
         navigation = action in EDITOR_PANELS or page.isdigit()
         if not navigation and state["revision"] != int(revision):
@@ -547,6 +587,30 @@ def routes(store):
             await show_effects(answer, clip)
         elif action in EFFECT_SECTIONS or action in STICKER_PANELS:
             await show_effect_settings(answer, clip, action)
+        elif sticker_action:
+            kind, side, index = sticker_action.groups()
+            panel = f"sticker-{side}"
+            if kind == "input":
+                await ask_for_input(answer, store, clip, STICKER_INPUT_HINT,
+                                    {"kind": "sticker-input", "side": side, "back": panel})
+                return
+            symbols = []
+            if kind == "pick":
+                if index is None or int(index) >= len(STICKER_PRESETS):
+                    return
+                symbol = STICKER_PRESETS[int(index)]
+                if sticker_image(symbol) is None:
+                    return
+                symbols = list(sticker_rows(settings).get(side, []))
+                if symbol in symbols:
+                    symbols = [selected for selected in symbols if selected != symbol]
+                elif len(symbols) < MAX_STICKERS_PER_SIDE:
+                    symbols.append(symbol)
+                else:
+                    await answer("Здесь уже три эмодзи. Нажми на выбранный эмодзи, чтобы убрать его.")
+                    return
+            save_stickers(store, clip, side, symbols)
+            await show_effect_settings(answer, clip, panel)
         elif action == "border-custom":
             await ask_for_input(answer, store, clip, "Введи код цвета, например #38E8C6.",
                                 {"kind": "border-color", "back": "border"})
@@ -564,20 +628,10 @@ def routes(store):
                 settings["monochrome"] = 0
             advance(store, clip)
             await show_effect_settings(answer, clip, "monochrome")
-        elif action.startswith("time-") and (action[5:] == "mono" or action[5:] in STICKERS):
-            name = action[5:]
-            back = "monochrome" if name == "mono" else f"sticker-{name}"
+        elif action == "time-mono":
             await ask_for_input(answer, store, clip,
                                 "Укажи время от начала выбранного видео, например 0:03 или 3.",
-                                {"kind": "effect-time", "effect": name, "back": back})
-        elif action.startswith("remove-") and action[7:] in STICKERS:
-            name = action[7:]
-            stickers = settings.get("stickers", {})
-            stickers.pop(name, None)
-            if not stickers:
-                settings.pop("stickers", None)
-            advance(store, clip)
-            await show_effect_settings(answer, clip, f"sticker-{name}")
+                                {"kind": "effect-time", "effect": "mono", "back": "monochrome"})
         elif action.startswith("effect-") and action[7:] in EFFECTS:
             effect = action[7:]
             enabled = set(active_effects(settings))

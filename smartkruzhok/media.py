@@ -571,7 +571,7 @@ def frame_for(frame, number, settings, trajectory, lines, starts, mask):
         canvas = cv2.cvtColor(cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
     if border := settings.get("border"):
         add_border(canvas, border)
-    visual_effects.add_stickers(canvas, settings.get("stickers", {}), elapsed)
+    visual_effects.add_stickers(canvas, settings)
     subtitle_mode = settings.get("subtitles")
     caption, highlighted = caption_at(lines, starts, subtitle_mode, number / FPS)
     subtitle_position = "auto"
