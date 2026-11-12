@@ -5,11 +5,11 @@ from aiogram import F, Router
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
-    BotCommand, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
+    BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton,
     Message, ReplyKeyboardMarkup,
 )
 
-from .media import FPS, MAX_BYTES, PART_FRAMES, wrap
+from .media import FPS, MAX_BYTES, PART_FRAMES, active_effects, wrap
 
 NEW_VIDEO = "🎬 Новое видео"
 STATUS = "📋 Статус"
@@ -34,6 +34,7 @@ SUBTITLES = {"off": "Выключены", "plain": "Обычные", "words": "�
 CANCEL_KEYS = InlineKeyboardMarkup(inline_keyboard=[[
     InlineKeyboardButton(text="Отменить", callback_data="cancel-job"),
 ]])
+EDITOR_PANELS = {"result", "length", "decor", "crop", "subs", "title", "title-position", "effects"}
 
 
 def keys(clip, *rows):
@@ -53,7 +54,14 @@ def result_keys(clip):
 
 def length_keys(clip):
     return keys(clip, [("Первые 60 секунд", "first"), ("Разбить на кружки", "series")],
-                [("Выбрать фрагмент", "trim")])
+                [("Выбрать фрагмент", "trim-long")])
+
+
+def editor_back(kind, args):
+    return args.get("back") or {
+        "decor_preview": "decor", "transcribe": "decor",
+        "crop_preview": "crop", "face_preview": "crop",
+    }.get(kind, "result")
 
 
 def fragment_frames(text, video):
@@ -82,18 +90,19 @@ async def queue_notice(answer):
 def advance(store, clip):
     clip["state"]["revision"] += 1
     clip["state"].pop("prompt", None)
-    store.save(clip)
+    store.save(clip, refresh=True)
 
 
 def decor_panel(clip):
-    state = clip["state"]
-    settings = state["settings"]
+    settings = clip["state"]["settings"]
+    effects = ", ".join(EFFECTS[effect] for effect in active_effects(settings))
     return (
         f'Субтитры · {SUBTITLES[settings.get("subtitles", "off")]}\n'
         f'Надпись · {settings.get("title") or "выключена"}\n'
-        f'Эффект · {EFFECTS[settings.get("effect", "off")]}',
+        f'Эффекты · {effects or EFFECTS["off"]}',
         keys(clip, [("Субтитры", "subs"), ("Надпись", "title"), ("Эффекты", "effects")],
-             [("Предпросмотр", "decor-preview")]),
+             [("Предпросмотр", "decor-preview"), ("Сделать кружок", "decor-render")],
+             [("‹ Назад", "result")]),
     )
 
 
@@ -121,8 +130,40 @@ def subtitle_panel(clip, page=0):
     elif "lines" in clip["state"]:
         content = ["В видео не удалось найти речь."]
         rows = []
-    rows.append([("К оформлению", "decor")])
+    rows.append([("‹ К оформлению", "decor")])
     return "\n".join(content), keys(clip, *rows)
+
+
+def title_position_keys(clip):
+    return keys(clip, [("Сверху", "title-top"), ("Снизу", "title-bottom")], [("‹ Назад", "title")])
+
+
+async def show_effects(answer, clip):
+    enabled = active_effects(clip["state"]["settings"])
+    buttons = [(f"✓ {label}" if value in enabled else label, f"effect-{value}")
+               for value, label in EFFECTS.items() if value != "off"]
+    actions = [("Предпросмотр", "effects-preview")]
+    if enabled:
+        actions.append(("Отключить все", "effect-off"))
+    await answer("Нажми на эффект, чтобы включить или выключить его.", reply_markup=keys(
+        clip, buttons, actions, [("‹ К оформлению", "decor")],
+    ))
+
+
+async def ask_for_input(answer, store, clip, text, prompt):
+    kind = prompt["kind"]
+    rows = []
+    if kind == "line":
+        index = prompt["index"]
+        rows.append([("Удалить строку", f"delete-{index}")])
+        back = f"page-{index // 6}"
+    elif kind == "title":
+        back = "title"
+    else:
+        back = prompt.get("back", "result")
+    message = await answer(text, reply_markup=keys(clip, *rows, [("‹ Назад", back)]))
+    clip["state"]["prompt"] = prompt | {"message": message.message_id}
+    store.save(clip, new_prompt=True, refresh=True)
 
 
 def routes(store):
@@ -189,7 +230,7 @@ def routes(store):
     @router.message(F.text)
     async def input_text(message: Message):
         reply = message.reply_to_message
-        clip = store.prompt(message.chat.id, reply.message_id) if reply else None
+        clip = store.prompt(message.chat.id, reply.message_id if reply else None)
         if clip is None:
             body = EXPIRED if reply and reply.from_user and reply.from_user.is_bot else UPLOAD
             await message.answer(body, reply_markup=MENU)
@@ -203,36 +244,29 @@ def routes(store):
         if prompt["kind"] == "trim":
             fragment = fragment_frames(value, state["video"])
             if fragment is None:
-                retry = await message.answer(
+                await ask_for_input(
+                    message.answer, store, clip,
                     "Нужны начало и конец внутри видео, например 0:25–0:53. Отрезок должен быть не длиннее минуты.",
-                    reply_markup=ForceReply(),
+                    prompt,
                 )
-                prompt["message"] = retry.message_id
-                store.save(clip)
                 return
             if state.get("fragment") != fragment:
                 state.pop("lines", None)
             state.update(fragment=fragment, series=False)
             progress = await queue_notice(message.answer)
             store.enqueue(clip, "render", f'trim:{message.chat.id}:{message.message_id}',
-                          {"progress": progress}, revise=True)
+                          {"progress": progress, "back": prompt.get("back", "result")}, revise=True)
             return
         is_title = prompt["kind"] == "title"
         if not value or (is_title and len(value) > 60) or not wrap(value, 29 if is_title else 23):
-            retry = await message.answer(
-                "Сократи текст до двух строк и отправь его в ответ на это сообщение.",
-                reply_markup=ForceReply(),
-            )
-            prompt["message"] = retry.message_id
-            store.save(clip)
+            await ask_for_input(message.answer, store, clip,
+                                "Сократи текст до двух строк и отправь его сообщением.", prompt)
             return
         if is_title:
             state["settings"]["title"] = value
             state["settings"].setdefault("position", "top")
             advance(store, clip)
-            await message.answer("Где показать надпись?", reply_markup=keys(
-                clip, [("Сверху", "title-top"), ("Снизу", "title-bottom")],
-            ))
+            await message.answer("Где показать надпись?", reply_markup=title_position_keys(clip))
         else:
             index = prompt["index"]
             state["lines"][index].update(text=value, words=[])
@@ -255,12 +289,17 @@ def routes(store):
         await query.answer("Запрос принят." if job else "Это задание уже завершено.")
         if job:
             summary = "Останавливаю после текущего этапа."
+            markup = None
             if job["status"] == "queued" and not job["sending"]:
                 summary = "Отменено."
                 if job["sent"]:
                     summary += f' В чате осталось кружков: {job["sent"]}.'
+                clip = store.clip(job["clip"], job["chat"])
+                if clip and "video" in clip["state"]:
+                    back = editor_back(job["kind"], json.loads(job["args"]))
+                    markup = keys(clip, [("‹ Назад", back)])
             try:
-                await query.message.edit_text(summary)
+                await query.message.edit_text(summary, reply_markup=markup)
             except TelegramAPIError:
                 pass
 
@@ -279,12 +318,20 @@ def routes(store):
             await query.answer(BUSY)
             return
         state = clip["state"]
-        if state["revision"] != int(revision):
-            await query.answer("Эта кнопка устарела. Используй последнее сообщение.")
+        settings = state.get("settings")
+        page = action[5:] if action.startswith("page-") else ""
+        navigation = action in EDITOR_PANELS or page.isdigit()
+        if not navigation and state["revision"] != int(revision):
+            await query.answer("Настройки уже изменились.")
+            if settings is not None:
+                body, markup = decor_panel(clip)
+                await query.message.answer(body, reply_markup=markup)
             return
         await query.answer()
-        settings = state.get("settings", {})
         answer = query.message.answer
+        if navigation and settings is not None:
+            state.pop("prompt", None)
+            store.save(clip, refresh=True)
 
         async def enqueue(kind, *, revise=False, **arguments):
             key = f'{chat}:{query.message.message_id}:{query.data}'
@@ -303,42 +350,48 @@ def routes(store):
                 args = job["args"] | {"progress": await queue_notice(answer)}
                 store.mark(job, sending=0, args=args)
                 store.retry(job)
+        elif settings is None:
+            return
+        elif action == "result":
+            await answer("Что сделать с этим видео?", reply_markup=result_keys(clip))
+        elif action == "length":
+            await answer("Как обработать длинное видео?", reply_markup=length_keys(clip))
         elif action in ("first", "series"):
             if state.pop("fragment", None) or state["series"] != (action == "series"):
                 state.pop("lines", None)
             state["series"] = action == "series"
-            await enqueue("render", revise=True)
-        elif action == "trim":
-            prompt = await answer("Ответь диапазоном начала и конца, например 0:25–0:53. Максимум 60 секунд.",
-                                  reply_markup=ForceReply())
-            state["prompt"] = {"kind": "trim", "message": prompt.message_id}
-            store.save(clip)
+            await enqueue("render", revise=True, back="length")
+        elif action in ("trim", "trim-long"):
+            await ask_for_input(answer, store, clip,
+                                "Отправь начало и конец фрагмента, например 0:25–0:53. Максимум 60 секунд.",
+                                {"kind": "trim", "back": "length" if action == "trim-long" else "result"})
         elif action == "quick-subs":
             await enqueue("render", revise=True, quick_subtitles=True)
         elif action == "crop":
             await answer("Как обрезать кадр?", reply_markup=keys(
                 clip, *([(name, f"mode-{mode}")] for mode, name in MODES.items()),
                 [("Выбрать лицо", "faces"), ("Автовыбор лица", "face-auto")],
+                [("‹ Назад", "result")],
             ))
         elif action == "faces":
             await enqueue("face_preview", revise=True)
         elif action == "face-auto":
             settings.pop("face", None)
             settings["mode"] = "smart"
-            await enqueue("render", revise=True)
+            await enqueue("render", revise=True, back="crop")
         elif action.startswith("face-") and action[5:].isdigit():
             index = int(action[5:])
             sample = state.get("face_preview")
             if sample and 0 <= index < sample[1]:
                 settings["face"] = [sample[0], index]
                 settings["mode"] = "smart"
-                await enqueue("render", revise=True)
+                await enqueue("render", revise=True, back="crop")
         elif action.startswith("mode-") and action[5:] in MODES:
             mode = action[5:]
             await enqueue("crop_preview", revise=True, mode=mode)
         elif action.startswith("render-") and action[7:] in MODES:
             settings["mode"] = action[7:]
-            await enqueue("render", revise=True)
+            await enqueue("render", revise=True, back="crop")
         elif action == "decor":
             await show_decor()
         elif action == "subs":
@@ -351,21 +404,14 @@ def routes(store):
             settings["subtitles"] = action[4:]
             advance(store, clip)
             await show_decor()
-        elif action.startswith("page-") and action[5:].isdigit():
-            body, markup = subtitle_panel(clip, int(action[5:]))
+        elif page.isdigit():
+            body, markup = subtitle_panel(clip, int(page))
             await answer(body, reply_markup=markup)
         elif action.startswith("line-") and action[5:].isdigit():
             index = int(action[5:])
             if index < len(state.get("lines", [])):
-                prompt = await answer(
-                    f'Отправь новый текст строки {index + 1} в ответ на это сообщение.',
-                    reply_markup=ForceReply(),
-                )
-                state["prompt"] = {"kind": "line", "index": index, "message": prompt.message_id}
-                store.save(clip)
-                await answer(f"Строка {index + 1}", reply_markup=keys(
-                    clip, [("Удалить строку", f"delete-{index}")],
-                ))
+                await ask_for_input(answer, store, clip, f"Отправь новый текст строки {index + 1}.",
+                                    {"kind": "line", "index": index})
         elif action.startswith("delete-") and action[7:].isdigit():
             index = int(action[7:])
             if index < len(state.get("lines", [])):
@@ -374,16 +420,16 @@ def routes(store):
                 body, markup = subtitle_panel(clip, index // 6)
                 await answer(body, reply_markup=markup)
         elif action == "title":
-            await answer("Настрой надпись.", reply_markup=keys(
-                clip, [("Ввести текст", "title-input"), ("Убрать надпись", "title-off")],
-            ))
+            title = settings.get("title")
+            rows = [[("Изменить текст" if title else "Ввести текст", "title-input")]]
+            if title:
+                rows.append([("Расположение", "title-position"), ("Убрать надпись", "title-off")])
+            await answer(f"Надпись · {title or 'выключена'}", reply_markup=keys(
+                clip, *rows, [("‹ К оформлению", "decor")]))
         elif action == "title-input":
-            prompt = await answer(
-                "Отправь надпись до 60 символов в ответ на это сообщение.",
-                reply_markup=ForceReply(),
-            )
-            state["prompt"] = {"kind": "title", "message": prompt.message_id}
-            store.save(clip)
+            await ask_for_input(answer, store, clip, "Отправь надпись до 60 символов.", {"kind": "title"})
+        elif action == "title-position":
+            await answer("Где показать надпись?", reply_markup=title_position_keys(clip))
         elif action in ("title-top", "title-bottom", "title-off"):
             if action == "title-off":
                 settings.pop("title", None)
@@ -392,17 +438,23 @@ def routes(store):
             advance(store, clip)
             await show_decor()
         elif action == "effects":
-            await answer("Выбери эффект.", reply_markup=keys(
-                clip, *([(label, f"effect-{value}")] for value, label in EFFECTS.items()),
-            ))
+            await show_effects(answer, clip)
         elif action.startswith("effect-") and action[7:] in EFFECTS:
-            settings["effect"] = action[7:]
+            effect = action[7:]
+            enabled = set(active_effects(settings))
+            if effect == "off":
+                enabled.clear()
+            else:
+                enabled.symmetric_difference_update((effect,))
+            settings["effects"] = [value for value in EFFECTS if value in enabled]
+            settings.pop("effect", None)
             advance(store, clip)
-            await show_decor()
-        elif action in ("decor-preview", "zoom-preview"):
-            await enqueue("decor_preview", zoom=action == "zoom-preview")
+            await show_effects(answer, clip)
+        elif action in ("decor-preview", "zoom-preview", "effects-preview", "effects-zoom-preview"):
+            back = "effects" if action.startswith("effects-") else "decor"
+            await enqueue("decor_preview", revise=True, zoom=action.endswith("zoom-preview"), back=back)
         elif action == "decor-render":
-            await enqueue("render", revise=True)
+            await enqueue("render", revise=True, back="decor")
 
     @router.message()
     async def other(message: Message):

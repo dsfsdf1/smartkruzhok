@@ -10,7 +10,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramNet
 from aiogram.types import FSInputFile
 
 from . import media
-from .ui import CANCEL_KEYS, MODES, keys, length_keys, result_keys, subtitle_panel
+from .ui import CANCEL_KEYS, MODES, editor_back, keys, length_keys, result_keys, subtitle_panel
 
 log = logging.getLogger(__name__)
 
@@ -57,7 +57,9 @@ class Worker:
                 text = "Отменено."
                 if job["sent"]:
                     text += f' В чате осталось кружков: {job["sent"]}.'
-                markup = result_keys(clip) if "video" in clip["state"] else None
+                markup = None
+                if "video" in clip["state"]:
+                    markup = keys(clip, [("‹ Назад", editor_back(job["kind"], job["args"]))])
                 await self.finish_notice(job, text, markup)
                 self.store.mark(job, status="cancelled", args={})
             except Exception as error:
@@ -124,14 +126,10 @@ class Worker:
         if not retry and job["kind"] == "ingest":
             clip["expires"] = 0
             self.store.save(clip)
-        markup = keys(clip, [("Повторить", f'retry-{job["id"]}')]) if retry else None
-        if job["kind"] in ("decor_preview", "transcribe") and "settings" in clip["state"]:
-            back = ("К оформлению", "decor")
-            row = [("Повторить", f'retry-{job["id"]}'), back] if retry else [back]
-            markup = keys(clip, row)
-        if job["kind"] in ("crop_preview", "face_preview"):
-            row = [("Другой кадр", "crop"), ("К оформлению", "decor")]
-            markup = keys(clip, [("Повторить", f'retry-{job["id"]}')], row) if retry else keys(clip, row)
+        row = [("Повторить", f'retry-{job["id"]}')] if retry else []
+        if "video" in clip["state"] and not (job["kind"] == "ingest" and not retry):
+            row.append(("‹ Назад", editor_back(job["kind"], job["args"])))
+        markup = keys(clip, row) if row else None
         if retry:
             self.store.save(clip, refresh=True)
         await self.finish_notice(job, message, markup)
@@ -187,9 +185,9 @@ class Worker:
         first, end = parts[0][0], parts[-1][1]
         settings["zoom_start"] = first
         if job["kind"] in ("render", "decor_preview"):
-            log.info("settings kind=%s crop=%s subtitles=%s title=%s effect=%s",
+            log.info("settings kind=%s crop=%s subtitles=%s title=%s effects=%s",
                      job["kind"], settings["mode"], settings.get("subtitles", "off"),
-                     bool(settings.get("title")), settings.get("effect", "off"))
+                     bool(settings.get("title")), media.active_effects(settings))
         quick = job["args"].get("quick_subtitles")
         wants_subtitles = quick or settings.get("subtitles") in ("plain", "words")
         if "lines" not in state and (job["kind"] == "transcribe" or wants_subtitles):
@@ -207,7 +205,7 @@ class Worker:
             if has_speech:
                 state["settings"]["subtitles"] = "plain"
             state["revision"] += 1
-            self.store.save(clip)
+            self.store.save(clip, refresh=True)
             body, markup = subtitle_panel(clip)
             await self.edit_notice(job, "Распознавание завершено.")
             await self.bot.send_message(chat, body, reply_markup=markup)
@@ -226,8 +224,8 @@ class Worker:
 
         if job["kind"] == "crop_preview":
             settings["mode"] = job["args"]["mode"]
-        needs_face = (settings["mode"] == "smart" or settings.get("effect") == "zoom"
-                      or settings.get("title") or settings.get("subtitles") in ("plain", "words"))
+        needs_face = (settings["mode"] == "smart" or "zoom" in media.active_effects(settings)
+                      or settings.get("subtitles") in ("plain", "words"))
         trajectory = []
         if needs_face:
             await self.step(job, "Подбираю кадр.")
@@ -251,7 +249,8 @@ class Worker:
         midpoint = (low + high) / 2
         sample = max(range(low, high), key=lambda index: (len(faces[index]), -abs(index - midpoint)), default=None)
         if sample is None or not faces[sample]:
-            await self.finish_notice(job, "На этом фрагменте не удалось найти лицо.", result_keys(clip))
+            await self.finish_notice(job, "На этом фрагменте не удалось найти лицо.",
+                                     keys(clip, [("‹ К кадрированию", "crop")]))
             return
         photo = scratch / "faces.jpg"
         await asyncio.to_thread(media.face_photo, source, video, sample, faces[sample], photo)
@@ -261,6 +260,7 @@ class Worker:
         options = [(str(index + 1), f"face-{index}") for index in range(len(faces[sample]))]
         rows = [options[index:index + 4] for index in range(0, len(options), 4)]
         rows.append([("Автовыбор лица", "face-auto")])
+        rows.append([("‹ К кадрированию", "crop")])
         await self.edit_notice(job, "Кадр с лицами готов.")
         await self.bot.send_photo(clip["chat"], FSInputFile(photo), caption="Выбери, за кем следить.",
                                   reply_markup=keys(clip, *rows))
@@ -274,14 +274,14 @@ class Worker:
         await self.bot.send_photo(
             clip["chat"], FSInputFile(image), caption=MODES[settings["mode"]],
             reply_markup=keys(clip, [("Сделать", f'render-{settings["mode"]}')],
-                              [("Другой кадр", "crop"), ("К оформлению", "decor")]),
+                              [("‹ К кадрированию", "crop"), ("К оформлению", "decor")]),
         )
 
     async def decor_preview(self, job, clip, source, video, settings, trajectory, lines, parts, scratch):
         start, end = parts[0]
         first = start
         span = 4 * media.FPS
-        if settings.get("subtitles") in ("plain", "words") and not job["args"]["zoom"]:
+        if settings.get("subtitles") in ("plain", "words") and not job["args"].get("zoom"):
             line = next((line for line in lines if line["text"]), None)
             if line:
                 line_start = int(line["start"] * media.FPS)
@@ -294,9 +294,11 @@ class Worker:
                                 trajectory, lines, path, mask=True)
         self.check_cancel(job)
         await self.edit_notice(job, "Предпросмотр готов.")
-        rows = [[("Сделать", "decor-render"), ("Изменить", "decor")]]
-        if settings.get("effect") == "zoom" and first > parts[0][0]:
-            rows.append([("Посмотреть начало", "zoom-preview")])
+        back = editor_back(job["kind"], job["args"])
+        rows = [[("Сделать кружок", "decor-render"), ("‹ Назад", back)]]
+        if "zoom" in media.active_effects(settings) and first > parts[0][0]:
+            action = "effects-zoom-preview" if back == "effects" else "zoom-preview"
+            rows.append([("Посмотреть начало", action)])
         await self.bot.send_video(
             clip["chat"], FSInputFile(path), caption="Предпросмотр оформления",
             width=media.SIZE, height=media.SIZE, supports_streaming=True, reply_markup=keys(clip, *rows),

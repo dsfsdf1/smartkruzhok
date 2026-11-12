@@ -318,7 +318,14 @@ def box_in_frame(box, x, y, scale):
     return (box[0] * scale + x, box[1] * scale + y, box[2] * scale, box[3] * scale)
 
 
-def compose_frame(frame, mode, effect, frame_number, trajectory, zoom_start=0):
+def active_effects(settings):
+    if "effects" in settings:
+        return settings["effects"]
+    legacy = settings.get("effect")
+    return [legacy] if legacy in ("retro", "zoom") else []
+
+
+def compose_frame(frame, mode, effects, frame_number, trajectory, zoom_start=0):
     height, width = frame.shape[:2]
     center = (width / 2, height / 2)
     tracked, box = sample_track(trajectory, frame_number)
@@ -340,7 +347,7 @@ def compose_frame(frame, mode, effect, frame_number, trajectory, zoom_start=0):
         canvas, x, y, scale = square_crop(frame, focus, min(width, height))
         face = box_in_frame(box, -x * scale, -y * scale, scale)
     elapsed = frame_number - zoom_start
-    if effect == "zoom" and 0 <= elapsed < 2 * FPS:
+    if "zoom" in effects and 0 <= elapsed < 2 * FPS:
         phase = math.sin(math.pi * elapsed / (2 * FPS)) ** 2
         focus = face_center(face) if face is not None else (SIZE / 2, SIZE / 2)
         side = SIZE / (1 + 0.32 * phase)
@@ -348,7 +355,7 @@ def compose_frame(frame, mode, effect, frame_number, trajectory, zoom_start=0):
         zoom_face = box_in_frame(face, -x * scale, -y * scale, scale)
         if zoom_face is None or inside_circle(zoom_face):
             canvas, face = zoomed, zoom_face
-    if effect == "retro":
+    if "retro" in effects:
         blue, green, red = cv2.split(canvas)
         blue = cv2.addWeighted(blue, 0.82, np.roll(blue, 2, axis=1), 0.18, 8)
         red = cv2.addWeighted(red, 0.72, np.roll(red, -3, axis=1), 0.28, 10)
@@ -451,17 +458,7 @@ def decorate(canvas, face, title, position, caption, highlighted):
             layers.append(caption_layer)
     if not layers:
         return canvas
-    if face is not None and any(overlaps(rect, face) for rect, _, _ in layers):
-        top = max((y + h for (_, y, _, h), _, _ in layers if y < SIZE / 2), default=30)
-        bottom = min((y for (_, y, _, _), _, _ in layers if y >= SIZE / 2), default=SIZE - 30)
-        side = bottom - top - 8
-        offset_x = (SIZE - side) // 2
-        offset_y = (top + bottom - side) // 2
-        small = cv2.resize(canvas, (side, side), interpolation=cv2.INTER_AREA)
-        canvas = (cv2.GaussianBlur(canvas, (0, 0), 18) * 0.46).astype(np.uint8)
-        canvas[offset_y:offset_y + side, offset_x:offset_x + side] = small
-    else:
-        canvas = canvas.copy()
+    canvas = canvas.copy()
     for (x, y, width, height), pixels, alpha in layers:
         region = canvas[y:y + height, x:x + width]
         region[:] = region * (1 - alpha) + pixels * alpha
@@ -527,7 +524,7 @@ def caption_at(lines, starts, mode, seconds):
 
 
 def frame_for(frame, number, settings, trajectory, lines, starts, mask):
-    canvas, face = compose_frame(frame, settings["mode"], settings.get("effect"), number, trajectory,
+    canvas, face = compose_frame(frame, settings["mode"], active_effects(settings), number, trajectory,
                                  settings.get("zoom_start", 0))
     caption, highlighted = caption_at(lines, starts, settings.get("subtitles"), number / FPS)
     canvas = decorate(canvas, face, settings.get("title", ""), settings.get("position"), caption, highlighted)

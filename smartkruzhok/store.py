@@ -91,20 +91,24 @@ class Store:
             return None
         return dict(row) | {"state": json.loads(row["state"])}
 
-    def save(self, clip, *, refresh=False):
+    def save(self, clip, *, refresh=False, new_prompt=False):
         expires = time.time() + TTL if refresh else clip["expires"]
         with self.db:
+            if new_prompt:
+                self.clear_prompts(clip["chat"])
             self.db.execute(
                 "UPDATE clips SET state = ?, expires = ? WHERE id = ?",
                 (json.dumps(clip["state"]), expires, clip["id"]),
             )
         clip["expires"] = expires
 
-    def prompt(self, chat, message):
-        row = self.db.execute(
-            "SELECT id FROM clips WHERE chat = ? AND json_extract(state, '$.prompt.message') = ?",
-            (chat, message),
-        ).fetchone()
+    def prompt(self, chat, message=None):
+        row = self.db.execute("""
+            SELECT id FROM clips
+            WHERE chat = ? AND expires >= ? AND json_type(state, '$.prompt.message') = 'integer'
+                AND (? IS NULL OR json_extract(state, '$.prompt.message') = ?)
+            ORDER BY json_extract(state, '$.prompt.message') DESC LIMIT 1
+        """, (chat, time.time(), message, message)).fetchone()
         return self.clip(row["id"], chat) if row else None
 
     def busy(self, chat):
