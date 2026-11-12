@@ -1,0 +1,150 @@
+import json
+import sqlite3
+import time
+from pathlib import Path
+from uuid import uuid4
+
+TTL = 30 * 60
+
+
+class Store:
+    def __init__(self, path: Path):
+        self.db = sqlite3.connect(path)
+        self.db.row_factory = sqlite3.Row
+        self.db.executescript("""
+            PRAGMA journal_mode = WAL;
+            PRAGMA secure_delete = ON;
+            CREATE TABLE IF NOT EXISTS clips (
+                id TEXT PRIMARY KEY,
+                chat INTEGER NOT NULL,
+                message INTEGER NOT NULL,
+                state TEXT NOT NULL,
+                expires REAL NOT NULL,
+                UNIQUE (chat, message)
+            );
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY,
+                clip TEXT NOT NULL,
+                chat INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                dedupe TEXT NOT NULL UNIQUE,
+                args TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                sent INTEGER NOT NULL DEFAULT 0,
+                announced INTEGER NOT NULL DEFAULT 0,
+                sending INTEGER NOT NULL DEFAULT 0,
+                created REAL NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS one_job_per_chat ON jobs(chat)
+                WHERE status IN ('queued', 'running');
+        """)
+        with self.db:
+            self.db.execute("UPDATE jobs SET status = 'queued' WHERE status = 'running'")
+
+    def upload(self, chat, message, file_id):
+        if self.db.execute("SELECT 1 FROM clips WHERE chat = ? AND message = ?", (chat, message)).fetchone():
+            return None
+        clip_id = uuid4().hex[:16]
+        with self.db:
+            self.db.execute(
+                "INSERT INTO clips VALUES (?, ?, ?, ?, ?)",
+                (clip_id, chat, message, json.dumps({"revision": 0}), time.time() + TTL),
+            )
+            self._enqueue(clip_id, chat, "ingest", f"upload:{chat}:{message}", {"file_id": file_id})
+        return clip_id
+
+    def _enqueue(self, clip_id, chat, kind, key, args):
+        self.db.execute(
+            "INSERT INTO jobs(clip, chat, kind, dedupe, args, created) VALUES (?, ?, ?, ?, ?, ?)",
+            (clip_id, chat, kind, key, json.dumps(args), time.time()),
+        )
+
+    def enqueue(self, clip, kind, key, args, *, revise=False):
+        if self.db.execute("SELECT 1 FROM jobs WHERE dedupe = ?", (key,)).fetchone():
+            return False
+        with self.db:
+            self._enqueue(clip["id"], clip["chat"], kind, key, args)
+            if revise:
+                clip["state"]["revision"] += 1
+                clip["state"].pop("prompt", None)
+                self.db.execute("UPDATE clips SET state = ? WHERE id = ?",
+                                (json.dumps(clip["state"]), clip["id"]))
+        return True
+
+    def clip(self, clip_id, chat=None, *, active=True):
+        row = self.db.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
+        if row is None or (chat is not None and row["chat"] != chat):
+            return None
+        if active and row["expires"] < time.time():
+            return None
+        return dict(row) | {"state": json.loads(row["state"])}
+
+    def save(self, clip, *, refresh=False):
+        expires = time.time() + TTL if refresh else clip["expires"]
+        with self.db:
+            self.db.execute(
+                "UPDATE clips SET state = ?, expires = ? WHERE id = ?",
+                (json.dumps(clip["state"]), expires, clip["id"]),
+            )
+        clip["expires"] = expires
+
+    def prompt(self, chat, message):
+        row = self.db.execute(
+            "SELECT id FROM clips WHERE chat = ? AND json_extract(state, '$.prompt.message') = ?",
+            (chat, message),
+        ).fetchone()
+        return self.clip(row["id"], chat) if row else None
+
+    def busy(self, chat):
+        return self.db.execute(
+            "SELECT 1 FROM jobs WHERE chat = ? AND status IN ('queued', 'running')", (chat,),
+        ).fetchone() is not None
+
+    def take(self):
+        with self.db:
+            row = self.db.execute(
+                "SELECT * FROM jobs WHERE status = 'queued' ORDER BY id LIMIT 1"
+            ).fetchone()
+            if row is None:
+                return None
+            self.db.execute("UPDATE jobs SET status = 'running' WHERE id = ?", (row["id"],))
+        return dict(row) | {"args": json.loads(row["args"])}
+
+    def job(self, job_id, clip_id):
+        row = self.db.execute("SELECT * FROM jobs WHERE id = ? AND clip = ?", (job_id, clip_id)).fetchone()
+        return dict(row) | {"args": json.loads(row["args"])} if row else None
+
+    def mark(self, job, *, status=None, sent=None, announced=None, sending=None, args=None):
+        job.update({k: v for k, v in {
+            "status": status, "sent": sent, "announced": announced, "sending": sending, "args": args,
+        }.items() if v is not None})
+        with self.db:
+            self.db.execute(
+                "UPDATE jobs SET status = ?, sent = ?, announced = ?, sending = ?, args = ? WHERE id = ?",
+                (job["status"], job["sent"], job["announced"], job["sending"],
+                 json.dumps(job["args"]), job["id"]),
+            )
+
+    def retry(self, job):
+        with self.db:
+            self.db.execute(
+                "UPDATE jobs SET status = 'queued' WHERE id = ? AND status = 'failed'", (job["id"],),
+            )
+
+    def expired(self):
+        rows = self.db.execute("""
+            SELECT id FROM clips WHERE expires < ? AND state != '{}' AND NOT EXISTS (
+                SELECT 1 FROM jobs WHERE jobs.clip = clips.id AND status IN ('queued', 'running')
+            )
+        """, (time.time(),)).fetchall()
+        return [row["id"] for row in rows]
+
+    def forget_media(self, clip_id):
+        # Retain only the upload dedupe key, so late redelivery cannot start a new conversion.
+        with self.db:
+            self.db.execute("DELETE FROM jobs WHERE clip = ?", (clip_id,))
+            self.db.execute("UPDATE clips SET state = '{}' WHERE id = ?", (clip_id,))
+        self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    def close(self):
+        self.db.close()

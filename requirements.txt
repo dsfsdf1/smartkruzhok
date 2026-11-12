@@ -1,0 +1,4 @@
+aiogram>=3.20,<4
+opencv-python-headless>=4.10,<5
+faster-whisper>=1.2,<2
+Pillow>=11,<13

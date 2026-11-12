@@ -1,0 +1,60 @@
+import asyncio
+import fcntl
+import logging
+import os
+import shutil
+from pathlib import Path
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+
+from .store import Store
+from .ui import routes
+from .worker import Worker
+
+
+async def main(token, root):
+    session = AiohttpSession(timeout=45)
+    async with Bot(token, session=session) as bot:
+        dispatcher = Dispatcher()
+        store = Store(root / "bot.sqlite3")
+        dispatcher.include_router(routes(store))
+        stop = asyncio.Event()
+        worker = asyncio.create_task(Worker(store, bot, root / "clips").run(stop))
+
+        async def poll():
+            await dispatcher.start_polling(bot, handle_as_tasks=False, close_bot_session=False)
+
+        polling = asyncio.create_task(poll())
+        try:
+            completed, _ = await asyncio.wait((worker, polling), return_when=asyncio.FIRST_COMPLETED)
+            for task in completed:
+                task.result()
+        finally:
+            stop.set()
+            if not polling.done():
+                polling.cancel()
+            await asyncio.gather(worker, polling, return_exceptions=True)
+            store.close()
+
+
+if __name__ == "__main__":
+    token = os.getenv("BOT_TOKEN")
+    if not token:
+        raise SystemExit("Задай BOT_TOKEN в переменных окружения.")
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        raise SystemExit("Установи FFmpeg и ffprobe.")
+    os.umask(0o077)
+    root = Path(os.getenv("DATA_DIR", "data")).resolve()
+    root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    (root / "clips").mkdir(mode=0o700, exist_ok=True)
+    os.environ.setdefault("WHISPER_CACHE", str(root / "models"))
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.getLogger("aiogram").setLevel(logging.CRITICAL)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    with (root / "bot.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("Бот с этим каталогом данных уже запущен.")
+        asyncio.run(main(token, root))
