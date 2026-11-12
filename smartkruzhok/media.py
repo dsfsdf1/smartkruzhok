@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import wave
@@ -39,9 +40,38 @@ class Video:
     seconds: float
     audio: bool
 
-    def parts(self, series):
+    def parts(self, series, fragment=None, pauses=()):
+        if fragment:
+            return [tuple(fragment)]
         end = self.frames if series else min(self.frames, PART_FRAMES)
-        return [(start, min(start + PART_FRAMES, end)) for start in range(0, end, PART_FRAMES)]
+        parts = []
+        start = 0
+        while start < end:
+            limit = min(start + PART_FRAMES, end)
+            if limit < end:
+                limit = max((pause for pause in pauses if limit - 8 * FPS <= pause <= limit), default=limit)
+            parts.append((start, limit))
+            start = limit
+        return parts
+
+
+def speech_pauses(path):
+    result = subprocess.run([
+        "ffmpeg", "-hide_banner", "-nostdin", "-protocol_whitelist", "file,pipe", "-i", str(path),
+        "-map", "0:a:0", "-af", "silencedetect=noise=-35dB:d=0.3", "-f", "null", "-",
+    ], capture_output=True, text=True, check=True, timeout=60)
+    pauses = []
+    start = None
+    for event, value in re.findall(r"silence_(start|end): (-?[\d.]+)", result.stderr):
+        if event == "start":
+            start = float(value)
+        elif start is not None:
+            end = float(value)
+            # Either edge can be too far from the time limit when silence is long.
+            midpoint = (start + end) / 2
+            pauses.extend(round(time * FPS) for time in (start + 0.15, midpoint, end - 0.15))
+            start = None
+    return sorted(set(pauses))
 
 
 def probe(path):
@@ -177,15 +207,49 @@ def select_track(samples):
     return track
 
 
-def analyze(path, video, cache):
+def face_samples(path, video, cache):
     if cache.exists():
         return json.loads(cache.read_text())
-    width, height = video.width, video.height
     samples = []
-    with video_frames(path, width, height, DETECT_FPS, 0, math.ceil(video.frames / FPS * DETECT_FPS)) as frames:
+    with video_frames(path, video.width, video.height, DETECT_FPS, 0,
+                      math.ceil(video.frames / FPS * DETECT_FPS)) as frames:
         for frame in frames:
-            samples.append(find_faces(frame))
-    track = select_track(samples)
+            samples.append(sorted(find_faces(frame), key=lambda box: (box[0], box[1]))[:8])
+    save_json(cache, samples)
+    return samples
+
+
+def follow_face(samples, index, seed):
+    def follow(groups):
+        previous = seed
+        missing = 0
+        for faces in groups:
+            candidate = min(faces, key=lambda box: match_score(box, previous), default=None)
+            if candidate is not None and match_score(candidate, previous) < 0.85:
+                missing = 0
+                previous = candidate
+            else:
+                missing += 1
+                if missing > 3:
+                    # A new detection after a long gap may be a different person.
+                    break
+            yield previous
+
+    before = list(follow(reversed(samples[:index])))
+    after = list(follow(samples[index + 1:]))
+    return ([None] * (index - len(before)) + before[::-1] + [seed] + after
+            + [None] * (len(samples) - index - 1 - len(after)))
+
+
+def analyze(path, video, cache, *, selected=None):
+    if cache.exists():
+        return json.loads(cache.read_text())
+    samples = face_samples(path, video, cache.with_name("faces.json"))
+    if selected is None:
+        track = select_track(samples)
+    else:
+        index, option = selected
+        track = follow_face(samples, index, samples[index][option])
     center = np.array([video.width / 2, video.height / 2])
     targets = np.array([face_center(box) if box else center for box in track])
     smooth = targets.copy()
@@ -194,10 +258,33 @@ def analyze(path, video, cache):
     for index in range(len(smooth) - 2, -1, -1):
         smooth[index] = 0.65 * smooth[index + 1] + 0.35 * smooth[index]
     trajectory = [[point.tolist(), box] for point, box in zip(smooth, track)]
-    pending = cache.with_suffix(".tmp")
-    pending.write_text(json.dumps(trajectory))
-    pending.replace(cache)
+    save_json(cache, trajectory)
     return trajectory
+
+
+def save_json(cache, value):
+    pending = cache.with_suffix(".tmp")
+    pending.write_text(json.dumps(value))
+    pending.replace(cache)
+
+
+def face_photo(path, video, sample, faces, output):
+    with video_frames(path, video.width, video.height, DETECT_FPS, sample, sample + 1) as frames:
+        frame = next(frames).copy()
+    scale = max(1.0, 480 / max(video.width, video.height))
+    if scale > 1:
+        frame = cv2.resize(frame, (round(video.width * scale), round(video.height * scale)))
+    height, width = frame.shape[:2]
+    for index, box in enumerate(faces, 1):
+        x, y, w, h = (round(value * scale) for value in box)
+        cv2.rectangle(frame, (x, y), (x + w, y + h), (55, 224, 255), 2)
+        label_x = min(max(0, x), max(0, width - 25))
+        label_y = min(max(22, y), height - 2)
+        cv2.rectangle(frame, (label_x, label_y - 22), (label_x + 25, label_y), (55, 224, 255), -1)
+        cv2.putText(frame, str(index), (label_x + 5, label_y - 5), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55, (25, 25, 25), 2, cv2.LINE_AA)
+    if not cv2.imwrite(str(output), frame):
+        raise MediaError("Не удалось сохранить кадр с лицами.")
 
 
 def sample_track(trajectory, frame_number):
@@ -231,7 +318,7 @@ def box_in_frame(box, x, y, scale):
     return (box[0] * scale + x, box[1] * scale + y, box[2] * scale, box[3] * scale)
 
 
-def compose_frame(frame, mode, effect, frame_number, trajectory):
+def compose_frame(frame, mode, effect, frame_number, trajectory, zoom_start=0):
     height, width = frame.shape[:2]
     center = (width / 2, height / 2)
     tracked, box = sample_track(trajectory, frame_number)
@@ -252,8 +339,9 @@ def compose_frame(frame, mode, effect, frame_number, trajectory):
                      float(np.clip(focus[1], face_y - tolerance, face_y + tolerance)))
         canvas, x, y, scale = square_crop(frame, focus, min(width, height))
         face = box_in_frame(box, -x * scale, -y * scale, scale)
-    if effect == "zoom" and frame_number < 2 * FPS:
-        phase = math.sin(math.pi * frame_number / (2 * FPS)) ** 2
+    elapsed = frame_number - zoom_start
+    if effect == "zoom" and 0 <= elapsed < 2 * FPS:
+        phase = math.sin(math.pi * elapsed / (2 * FPS)) ** 2
         focus = face_center(face) if face is not None else (SIZE / 2, SIZE / 2)
         side = SIZE / (1 + 0.32 * phase)
         zoomed, x, y, scale = square_crop(canvas, focus, side)
@@ -380,10 +468,10 @@ def decorate(canvas, face, title, position, caption, highlighted):
     return canvas
 
 
-def transcribe(path, seconds, audio_path):
+def transcribe(path, seconds, audio_path, *, start=0):
     subprocess.run([
-        "ffmpeg", "-v", "error", "-nostdin", "-y", "-protocol_whitelist", "file,pipe", "-i", str(path),
-        "-t", str(seconds), "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "16000",
+        "ffmpeg", "-v", "error", "-nostdin", "-y", "-protocol_whitelist", "file,pipe",
+        "-ss", str(start), "-i", str(path), "-t", str(seconds - start), "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "16000",
         "-af", "aresample=async=1:first_pts=0", str(audio_path),
     ], check=True, stderr=subprocess.DEVNULL, timeout=60)
     with wave.open(str(audio_path)) as audio:
@@ -397,20 +485,22 @@ def transcribe(path, seconds, audio_path):
     lines = []
     for segment in json.loads(speech.stdout):
         words = []
-        for start, end, value in segment["words"]:
+        for word_start, word_end, value in segment["words"]:
+            word_start += start
+            word_end += start
             value = value.strip()
             if not value or not wrap(value, 23):
                 continue
             candidate = " ".join([item[2] for item in words] + [value])
-            if words and (not wrap(candidate, 29) or len(words) == 6 or start - words[-1][1] > 0.55):
+            if words and (not wrap(candidate, 29) or len(words) == 6 or word_start - words[-1][1] > 0.55):
                 add_line(lines, words, seconds)
                 words = []
-            words.append([start, end, value])
+            words.append([word_start, word_end, value])
         if words:
             add_line(lines, words, seconds)
         elif not segment["words"] and wrap(segment["text"].strip(), 23):
-            if segment["start"] < min(seconds, segment["end"]):
-                lines.append({"start": segment["start"], "end": min(seconds, segment["end"]),
+            if segment["start"] + start < min(seconds, segment["end"] + start):
+                lines.append({"start": segment["start"] + start, "end": min(seconds, segment["end"] + start),
                               "text": segment["text"].strip(), "words": []})
     return lines
 
@@ -437,7 +527,8 @@ def caption_at(lines, starts, mode, seconds):
 
 
 def frame_for(frame, number, settings, trajectory, lines, starts, mask):
-    canvas, face = compose_frame(frame, settings["mode"], settings.get("effect"), number, trajectory)
+    canvas, face = compose_frame(frame, settings["mode"], settings.get("effect"), number, trajectory,
+                                 settings.get("zoom_start", 0))
     caption, highlighted = caption_at(lines, starts, settings.get("subtitles"), number / FPS)
     canvas = decorate(canvas, face, settings.get("title", ""), settings.get("position"), caption, highlighted)
     if mask:

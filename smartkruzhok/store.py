@@ -39,10 +39,17 @@ class Store:
                 WHERE status IN ('queued', 'running');
         """)
         with self.db:
+            if not any(column["name"] == "cancel_requested" for column in self.db.execute("PRAGMA table_info(jobs)")):
+                self.db.execute("ALTER TABLE jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
             self.db.execute("UPDATE jobs SET status = 'queued' WHERE status = 'running'")
 
-    def upload(self, chat, message, file_id):
-        if self.db.execute("SELECT 1 FROM clips WHERE chat = ? AND message = ?", (chat, message)).fetchone():
+    def uploaded(self, chat, message):
+        return self.db.execute(
+            "SELECT 1 FROM clips WHERE chat = ? AND message = ?", (chat, message),
+        ).fetchone() is not None
+
+    def upload(self, chat, message, file_id, progress=None):
+        if self.uploaded(chat, message):
             return None
         clip_id = uuid4().hex[:16]
         with self.db:
@@ -50,7 +57,8 @@ class Store:
                 "INSERT INTO clips VALUES (?, ?, ?, ?, ?)",
                 (clip_id, chat, message, json.dumps({"revision": 0}), time.time() + TTL),
             )
-            self._enqueue(clip_id, chat, "ingest", f"upload:{chat}:{message}", {"file_id": file_id})
+            self._enqueue(clip_id, chat, "ingest", f"upload:{chat}:{message}",
+                          {"file_id": file_id, "progress": progress})
         return clip_id
 
     def _enqueue(self, clip_id, chat, kind, key, args):
@@ -60,7 +68,7 @@ class Store:
         )
 
     def enqueue(self, clip, kind, key, args, *, revise=False):
-        if self.db.execute("SELECT 1 FROM jobs WHERE dedupe = ?", (key,)).fetchone():
+        if self.enqueued(key):
             return False
         with self.db:
             self._enqueue(clip["id"], clip["chat"], kind, key, args)
@@ -70,6 +78,9 @@ class Store:
                 self.db.execute("UPDATE clips SET state = ? WHERE id = ?",
                                 (json.dumps(clip["state"]), clip["id"]))
         return True
+
+    def enqueued(self, key):
+        return self.db.execute("SELECT 1 FROM jobs WHERE dedupe = ?", (key,)).fetchone() is not None
 
     def clip(self, clip_id, chat=None, *, active=True):
         row = self.db.execute("SELECT * FROM clips WHERE id = ?", (clip_id,)).fetchone()
@@ -128,8 +139,26 @@ class Store:
     def retry(self, job):
         with self.db:
             self.db.execute(
-                "UPDATE jobs SET status = 'queued' WHERE id = ? AND status = 'failed'", (job["id"],),
+                "UPDATE jobs SET status = 'queued', cancel_requested = 0 WHERE id = ? AND status = 'failed'",
+                (job["id"],),
             )
+
+    def request_cancel(self, chat, message):
+        row = self.db.execute("""
+            SELECT * FROM jobs WHERE chat = ? AND status IN ('queued', 'running')
+                AND json_extract(args, '$.progress') = ?
+        """, (chat, message)).fetchone()
+        if row is None:
+            return None
+        with self.db:
+            if row["status"] == "queued" and not row["sending"]:
+                self.db.execute("UPDATE jobs SET status = 'cancelled', args = '{}' WHERE id = ?", (row["id"],))
+            else:
+                self.db.execute("UPDATE jobs SET cancel_requested = 1 WHERE id = ?", (row["id"],))
+        return row
+
+    def cancelling(self, job_id):
+        return bool(self.db.execute("SELECT cancel_requested FROM jobs WHERE id = ?", (job_id,)).fetchone()[0])
 
     def expired(self):
         rows = self.db.execute("""

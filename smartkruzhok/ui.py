@@ -1,15 +1,21 @@
+import re
+
 from aiogram import F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import CommandStart
 from aiogram.types import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
-from .media import MAX_BYTES, wrap
+from .media import FPS, MAX_BYTES, PART_FRAMES, wrap
 
-START = "Пришли видео или файл MP4, MOV или WebM до 20 МБ и 3 минут. Я сделаю кружок."
+START = "SmartKruzhok 2.0. Пришли видео или файл MP4, MOV или WebM до 20 МБ и 3 минут. Я сделаю кружок."
 EXPIRED = "Срок редактирования истёк. Отправь видео снова."
 BUSY = "Я ещё обрабатываю предыдущее задание."
 MODES = {"smart": "Умный фокус", "center": "По центру", "fit": "Вместить всё"}
 EFFECTS = {"off": "Без эффекта", "retro": "Ретро", "zoom": "Драматический зум"}
 SUBTITLES = {"off": "Выключены", "plain": "Обычные", "words": "Подсветка слов"}
+CANCEL_KEYS = InlineKeyboardMarkup(inline_keyboard=[[
+    InlineKeyboardButton(text="Отменить", callback_data="cancel-job"),
+]])
 
 
 def keys(clip, *rows):
@@ -21,11 +27,36 @@ def keys(clip, *rows):
 
 
 def result_keys(clip):
-    return keys(clip, [("Переделать кадр", "crop"), ("Оформить кружок", "decor")])
+    return keys(clip, [("Переделать кадр", "crop"), ("Оформить кружок", "decor")],
+                [("Выбрать фрагмент", "trim"), ("С субтитрами", "quick-subs")])
 
 
 def length_keys(clip):
-    return keys(clip, [("Первые 60 секунд", "first"), ("Разбить на кружки", "series")])
+    return keys(clip, [("Первые 60 секунд", "first"), ("Разбить на кружки", "series")],
+                [("Выбрать фрагмент", "trim")])
+
+
+def fragment_frames(text, video):
+    match = re.fullmatch(r"([0-9]{1,3}(?::[0-5][0-9])?)\s*[-–—]\s*([0-9]{1,3}(?::[0-5][0-9])?)", text.strip())
+    if match is None:
+        return None
+    times = []
+    for value in match.groups():
+        minutes, _, seconds = value.rpartition(":")
+        times.append(int(minutes or 0) * 60 + int(seconds))
+    first, last = (time * FPS for time in times)
+    if 0 < last - first <= PART_FRAMES and last <= video["frames"]:
+        return [first, last]
+    return None
+
+
+async def queue_notice(answer):
+    try:
+        message = await answer("В очереди. Начну обработку, как только освобожусь.",
+                               reply_markup=CANCEL_KEYS)
+        return message.message_id
+    except TelegramAPIError:
+        return None
 
 
 def advance(store, clip):
@@ -88,11 +119,13 @@ def routes(store):
         if attachment.file_size and attachment.file_size > MAX_BYTES:
             await message.answer("Файл больше 20 МБ. Сожми видео или отправь фрагмент.")
             return
+        if store.uploaded(message.chat.id, message.message_id):
+            return
         if store.busy(message.chat.id):
             await message.answer(BUSY)
             return
-        if store.upload(message.chat.id, message.message_id, attachment.file_id):
-            await message.answer("Видео принято. Проверяю файл и готовлю кружок.")
+        progress = await queue_notice(message.answer)
+        store.upload(message.chat.id, message.message_id, attachment.file_id, progress)
 
     @router.message(F.text)
     async def input_text(message: Message):
@@ -107,6 +140,23 @@ def routes(store):
         state = clip["state"]
         prompt = state["prompt"]
         value = " ".join(message.text.split())
+        if prompt["kind"] == "trim":
+            fragment = fragment_frames(value, state["video"])
+            if fragment is None:
+                retry = await message.answer(
+                    "Нужны начало и конец внутри видео, например 0:25–0:53. Отрезок должен быть не длиннее минуты.",
+                    reply_markup=ForceReply(),
+                )
+                prompt["message"] = retry.message_id
+                store.save(clip)
+                return
+            if state.get("fragment") != fragment:
+                state.pop("lines", None)
+            state.update(fragment=fragment, series=False)
+            progress = await queue_notice(message.answer)
+            store.enqueue(clip, "render", f'trim:{message.chat.id}:{message.message_id}',
+                          {"progress": progress}, revise=True)
+            return
         is_title = prompt["kind"] == "title"
         if not value or (is_title and len(value) > 60) or not wrap(value, 29 if is_title else 23):
             retry = await message.answer(
@@ -130,6 +180,24 @@ def routes(store):
             body, markup = subtitle_panel(clip, index // 6)
             await message.answer(body, reply_markup=markup)
 
+    @router.callback_query(F.data == "cancel-job")
+    async def cancel_job(query):
+        if not isinstance(query.message, Message) or query.message.chat.type != "private":
+            await query.answer()
+            return
+        job = store.request_cancel(query.message.chat.id, query.message.message_id)
+        await query.answer("Запрос принят." if job else "Это задание уже завершено.")
+        if job:
+            summary = "Останавливаю после текущего этапа."
+            if job["status"] == "queued" and not job["sending"]:
+                summary = "Отменено."
+                if job["sent"]:
+                    summary += f' В чате осталось кружков: {job["sent"]}.'
+            try:
+                await query.message.edit_text(summary)
+            except TelegramAPIError:
+                pass
+
     @router.callback_query(F.data.regexp(r"^[0-9a-f]{16}:\d+:"))
     async def controls(query):
         if not isinstance(query.message, Message) or query.message.chat.type != "private":
@@ -152,9 +220,12 @@ def routes(store):
         settings = state.get("settings", {})
         answer = query.message.answer
 
-        def enqueue(kind, *, revise=False, **arguments):
-            return store.enqueue(clip, kind, f'{chat}:{query.message.message_id}:{query.data}',
-                                 arguments, revise=revise)
+        async def enqueue(kind, *, revise=False, **arguments):
+            key = f'{chat}:{query.message.message_id}:{query.data}'
+            if store.enqueued(key):
+                return False
+            arguments["progress"] = await queue_notice(answer)
+            return store.enqueue(clip, kind, key, arguments, revise=revise)
 
         async def show_decor():
             body, markup = decor_panel(clip)
@@ -163,29 +234,50 @@ def routes(store):
         if action.startswith("retry-") and action[6:].isdigit():
             job = store.job(int(action[6:]), clip_id)
             if job and job["status"] == "failed":
-                store.mark(job, sending=0)
+                args = job["args"] | {"progress": await queue_notice(answer)}
+                store.mark(job, sending=0, args=args)
                 store.retry(job)
-                await answer("Повторяю обработку.")
         elif action in ("first", "series"):
+            if state.pop("fragment", None) or state["series"] != (action == "series"):
+                state.pop("lines", None)
             state["series"] = action == "series"
-            enqueue("render", revise=True)
-            await answer("Готовлю серию." if state["series"] else "Готовлю первую минуту.")
+            await enqueue("render", revise=True)
+        elif action == "trim":
+            prompt = await answer("Ответь диапазоном начала и конца, например 0:25–0:53. Максимум 60 секунд.",
+                                  reply_markup=ForceReply())
+            state["prompt"] = {"kind": "trim", "message": prompt.message_id}
+            store.save(clip)
+        elif action == "quick-subs":
+            await enqueue("render", revise=True, quick_subtitles=True)
         elif action == "crop":
             await answer("Как обрезать кадр?", reply_markup=keys(
                 clip, *([(name, f"mode-{mode}")] for mode, name in MODES.items()),
+                [("Выбрать лицо", "faces"), ("Автовыбор лица", "face-auto")],
             ))
+        elif action == "faces":
+            await enqueue("face_preview", revise=True)
+        elif action == "face-auto":
+            settings.pop("face", None)
+            settings["mode"] = "smart"
+            await enqueue("render", revise=True)
+        elif action.startswith("face-") and action[5:].isdigit():
+            index = int(action[5:])
+            sample = state.get("face_preview")
+            if sample and 0 <= index < sample[1]:
+                settings["face"] = [sample[0], index]
+                settings["mode"] = "smart"
+                await enqueue("render", revise=True)
         elif action.startswith("mode-") and action[5:] in MODES:
             mode = action[5:]
-            enqueue("crop_preview", revise=True, mode=mode)
+            await enqueue("crop_preview", revise=True, mode=mode)
         elif action.startswith("render-") and action[7:] in MODES:
             settings["mode"] = action[7:]
-            enqueue("render", revise=True)
+            await enqueue("render", revise=True)
         elif action == "decor":
             await show_decor()
         elif action == "subs":
             if "lines" not in state:
-                if enqueue("transcribe"):
-                    await answer("Распознаю речь. Это может занять немного времени.")
+                await enqueue("transcribe")
             else:
                 body, markup = subtitle_panel(clip)
                 await answer(body, reply_markup=markup)
@@ -242,10 +334,9 @@ def routes(store):
             advance(store, clip)
             await show_decor()
         elif action in ("decor-preview", "zoom-preview"):
-            if enqueue("decor_preview", zoom=action == "zoom-preview"):
-                await answer("Готовлю предпросмотр.")
+            await enqueue("decor_preview", zoom=action == "zoom-preview")
         elif action == "decor-render":
-            enqueue("render", revise=True)
+            await enqueue("render", revise=True)
 
     @router.message()
     async def other(message: Message):
