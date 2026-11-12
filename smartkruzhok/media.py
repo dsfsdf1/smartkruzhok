@@ -23,10 +23,12 @@ DETECT_FPS = 6
 MAX_SECONDS = 180
 MAX_BYTES = 20_000_000
 PART_FRAMES = 60 * FPS
-CIRCLE = np.fromfunction(
-    lambda y, x: (x - (SIZE - 1) / 2) ** 2 + (y - (SIZE - 1) / 2) ** 2 < (SIZE / 2) ** 2,
-    (SIZE, SIZE),
-)
+_axis = np.arange(SIZE, dtype=np.float32) - (SIZE - 1) / 2
+_distance = np.hypot(_axis[:, None], _axis[None, :])
+# Blend only across the contour, over two pixels at the output resolution.
+PREVIEW_OPACITY = np.clip((SIZE / 2 - _distance) / 2 + 0.5, 0, 1)
+BACKGROUND_OPACITY = 1 - PREVIEW_OPACITY
+PREVIEW_BACKGROUND = np.full((SIZE, SIZE, 3), (26, 25, 24), dtype=np.uint8)
 cv2.setNumThreads(2)
 
 
@@ -118,7 +120,7 @@ def video_frames(path, width, height, fps, first, last):
         "ffmpeg", "-v", "error", "-xerror", "-nostdin", "-threads", "2",
         "-protocol_whitelist", "file,pipe", "-i", str(path), "-map", "0:V:0", "-an", "-filter_threads", "2",
         "-vf", f"fps={fps}:start_time=0,tpad=stop_mode=clone:stop_duration=1,"
-        f"trim=start_frame={first}:end_frame={last},setpts=PTS-STARTPTS,scale={width}:{height}",
+        f"trim=start_frame={first}:end_frame={last},setpts=PTS-STARTPTS,scale={width}:{height}:flags=lanczos",
         "-frames:v", str(count), "-c:v", "rawvideo", "-threads", "1", "-pix_fmt", "bgr24",
         "-f", "rawvideo", "pipe:1",
     ]
@@ -306,12 +308,18 @@ def sample_track(trajectory, frame_number):
     return center, box
 
 
+def resize_frame(frame, width, height):
+    shrinking = width < frame.shape[1] or height < frame.shape[0]
+    interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_CUBIC
+    return cv2.resize(frame, (width, height), interpolation=interpolation)
+
+
 def square_crop(frame, center, side):
     height, width = frame.shape[:2]
     side = min(max(2, round(side)), width, height)
     x = int(np.clip(round(center[0] - side / 2), 0, width - side))
     y = int(np.clip(round(center[1] - side / 2), 0, height - side))
-    return cv2.resize(frame[y:y + side, x:x + side], (SIZE, SIZE)), x, y, SIZE / side
+    return resize_frame(frame[y:y + side, x:x + side], SIZE, SIZE), x, y, SIZE / side
 
 
 def box_in_frame(box, x, y, scale):
@@ -337,7 +345,7 @@ def compose_frame(frame, mode, effects, frame_number, trajectory, zoom_start=0):
         scale = (SIZE - 16) / math.hypot(width, height)
         w, h = max(1, int(width * scale)), max(1, int(height * scale))
         x, y = (SIZE - w) // 2, (SIZE - h) // 2
-        canvas[y:y + h, x:x + w] = cv2.resize(frame, (w, h))
+        canvas[y:y + h, x:x + w] = resize_frame(frame, w, h)
         face = box_in_frame(box, x, y, scale)
     else:
         focus = tracked if mode == "smart" and tracked is not None else center
@@ -559,7 +567,7 @@ def frame_for(frame, number, settings, trajectory, lines, starts, mask):
     canvas = decorate(canvas, face, settings.get("title", ""), settings.get("position", "bottom"),
                       caption, highlighted, subtitle_position=subtitle_position)
     if mask:
-        canvas[~CIRCLE] = (26, 25, 24)
+        canvas = cv2.blendLinear(canvas, PREVIEW_BACKGROUND, PREVIEW_OPACITY, BACKGROUND_OPACITY)
     return canvas
 
 
@@ -584,7 +592,8 @@ def render(path, video, first, last, settings, trajectory, lines, output, *, mas
     if video.audio:
         command += ["-protocol_whitelist", "file,pipe", "-ss", str(first / FPS), "-t", str(duration), "-i", str(path),
                     "-map", "0:v:0", "-map", "1:a:0", "-c:a", "aac", "-b:a", "96k"]
-    command += ["-t", str(duration), "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+    command += ["-t", str(duration), "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-maxrate", "3M", "-bufsize", "4M",
                 "-threads", "2", "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
     with subprocess.Popen(command, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL) as encoder:
         try:
