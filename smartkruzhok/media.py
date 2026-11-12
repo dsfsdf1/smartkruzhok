@@ -25,10 +25,16 @@ MAX_BYTES = 20_000_000
 PART_FRAMES = 60 * FPS
 _axis = np.arange(SIZE, dtype=np.float32) - (SIZE - 1) / 2
 _distance = np.hypot(_axis[:, None], _axis[None, :])
+_radius = SIZE / 2
 # Blend only across the contour, over two pixels at the output resolution.
-PREVIEW_OPACITY = np.clip((SIZE / 2 - _distance) / 2 + 0.5, 0, 1)
+PREVIEW_OPACITY = np.clip((_radius - _distance) / 2 + 0.5, 0, 1)
 BACKGROUND_OPACITY = 1 - PREVIEW_OPACITY
 PREVIEW_BACKGROUND = np.full((SIZE, SIZE, 3), (26, 25, 24), dtype=np.uint8)
+# Extend the border past the clip edge to keep the source out of the antialiased contour.
+_border_opacity = np.clip(np.minimum(_distance - (_radius - 6), _radius + 3 - _distance) / 2 + 0.5, 0, 1)
+BORDER_SOLID = np.where(_border_opacity == 1)
+BORDER_EDGE = np.where((_border_opacity > 0) & (_border_opacity < 1))
+BORDER_EDGE_OPACITY = _border_opacity[BORDER_EDGE][:, None]
 cv2.setNumThreads(2)
 
 
@@ -547,6 +553,13 @@ def caption_at(lines, starts, mode, seconds):
     return line["text"], active
 
 
+def add_border(canvas, color):
+    bgr = np.array(tuple(reversed(bytes.fromhex(color[1:]))), dtype=np.uint8)
+    canvas[BORDER_SOLID] = bgr
+    alpha = BORDER_EDGE_OPACITY
+    canvas[BORDER_EDGE] = np.rint(canvas[BORDER_EDGE] * (1 - alpha) + bgr * alpha)
+
+
 def frame_for(frame, number, settings, trajectory, lines, starts, mask):
     effects = active_effects(settings)
     start = settings.get("zoom_start", 0)
@@ -557,7 +570,7 @@ def frame_for(frame, number, settings, trajectory, lines, starts, mask):
     if "monochrome" in settings and elapsed >= settings["monochrome"]:
         canvas = cv2.cvtColor(cv2.cvtColor(canvas, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
     if border := settings.get("border"):
-        visual_effects.add_border(canvas, border)
+        add_border(canvas, border)
     visual_effects.add_stickers(canvas, settings.get("stickers", {}), elapsed)
     subtitle_mode = settings.get("subtitles")
     caption, highlighted = caption_at(lines, starts, subtitle_mode, number / FPS)

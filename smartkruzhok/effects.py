@@ -68,10 +68,3 @@ def add_stickers(canvas, stickers, elapsed):
             height, width = pixels.shape[:2]
             region = canvas[y:y + height, x:x + width]
             region[:] = region * (1 - alpha) + pixels * alpha
-
-
-def add_border(canvas, color):
-    rgb = bytes.fromhex(color[1:])
-    center = (canvas.shape[1] // 2, canvas.shape[0] // 2)
-    radius = min(center) - 9
-    cv2.circle(canvas, center, radius, tuple(reversed(rgb)), 5, cv2.LINE_AA)
